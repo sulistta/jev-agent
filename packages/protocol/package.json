@@ -1,0 +1,34 @@
+{
+    "name": "@page-agent/protocol",
+    "version": "0.1.0",
+    "type": "module",
+    "main": "./src/index.ts",
+    "types": "./src/index.ts",
+    "exports": {
+        ".": {
+            "types": "./src/index.ts",
+            "default": "./src/index.ts"
+        }
+    },
+    "publishConfig": {
+        "main": "./dist/page-agent-protocol.js",
+        "module": "./dist/page-agent-protocol.js",
+        "types": "./dist/index.d.ts",
+        "exports": {
+            ".": {
+                "types": "./dist/index.d.ts",
+                "import": "./dist/page-agent-protocol.js",
+                "default": "./dist/page-agent-protocol.js"
+            }
+        }
+    },
+    "files": [
+        "dist/"
+    ],
+    "description": "Wire-safe protocol contracts for Page Agent sessions",
+    "license": "MIT",
+    "scripts": {
+        "build": "vite build",
+        "test": "vitest run"
+    }
+}

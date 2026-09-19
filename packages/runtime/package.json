@@ -1,0 +1,38 @@
+{
+    "name": "@page-agent/runtime",
+    "version": "0.1.0",
+    "type": "module",
+    "main": "./src/index.ts",
+    "types": "./src/index.ts",
+    "exports": {
+        ".": {
+            "types": "./src/index.ts",
+            "default": "./src/index.ts"
+        }
+    },
+    "publishConfig": {
+        "main": "./dist/page-agent-runtime.js",
+        "module": "./dist/page-agent-runtime.js",
+        "types": "./dist/index.d.ts",
+        "exports": {
+            ".": {
+                "types": "./dist/index.d.ts",
+                "import": "./dist/page-agent-runtime.js",
+                "default": "./dist/page-agent-runtime.js"
+            }
+        }
+    },
+    "files": [
+        "dist/"
+    ],
+    "description": "Provider-neutral Page Agent session and execution runtime",
+    "license": "MIT",
+    "scripts": {
+        "build": "vite build",
+        "test": "vitest run"
+    },
+    "dependencies": {
+        "@page-agent/browser": "0.1.0",
+        "@page-agent/protocol": "0.1.0"
+    }
+}
