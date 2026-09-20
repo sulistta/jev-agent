@@ -44,7 +44,11 @@ export default defineBackground(() => {
 			createOriginGrant(message, sender).then(sendResponse)
 			return true
 		}
-		if (message?.type === 'PAGE_AGENT_V2_UI_START' || message?.type === 'PAGE_AGENT_V2_UI_CANCEL') {
+		if (
+			message?.type === 'PAGE_AGENT_V2_UI_START' ||
+			message?.type === 'PAGE_AGENT_V2_UI_CANCEL' ||
+			message?.type === 'PAGE_AGENT_V2_UI_REPLY'
+		) {
 			handleRunnerUiMessage(message, sender).then(sendResponse)
 			return true
 		}

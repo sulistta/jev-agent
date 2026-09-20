@@ -129,6 +129,8 @@ function predicateResult(
 			const value = observation.tabId === predicate.tabId
 			return { status: value ? 'satisfied' : 'inconclusive', value }
 		}
+		case 'runtime.managed':
+			return { status: 'inconclusive', value: false }
 	}
 }
 

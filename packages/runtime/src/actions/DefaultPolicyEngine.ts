@@ -26,7 +26,14 @@ export class DefaultPolicyEngine implements PolicyEngine {
 		) {
 			return 'deny'
 		}
-		return definition.confirmationRequired || definition.risk === 'R3' ? 'confirm' : 'allow'
+		if (
+			action.type === 'tab.open' &&
+			input.session.browserScope.ownedTabIds.length >= input.session.browserScope.maxTabs
+		)
+			return 'deny'
+		// The task's explicit capability grant is the authorization boundary. The runtime does not
+		// introduce a second action-class confirmation after the user has requested the operation.
+		return 'allow'
 	}
 
 	private isOriginAllowed(origins: string[], action: BrowserAction): boolean {

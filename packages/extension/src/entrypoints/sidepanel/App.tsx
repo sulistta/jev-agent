@@ -13,7 +13,6 @@ import {
 	InputGroupButton,
 	InputGroupTextarea,
 } from '@/components/ui/input-group'
-import { saveSession } from '@/lib/db'
 
 import { useSessionAgent } from '../../agent/useSessionAgent'
 
@@ -26,6 +25,7 @@ type View =
 export default function App() {
 	const [view, setView] = useState<View>({ name: 'chat' })
 	const [inputValue, setInputValue] = useState('')
+	const [submitError, setSubmitError] = useState<string | null>(null)
 	const historyRef = useRef<HTMLDivElement>(null)
 	const textareaRef = useRef<HTMLTextAreaElement>(null)
 
@@ -42,24 +42,6 @@ export default function App() {
 		configure,
 	} = useSessionAgent()
 
-	// Persist session when task finishes
-	const prevStatusRef = useRef(status)
-	useEffect(() => {
-		const prev = prevStatusRef.current
-		prevStatusRef.current = status
-
-		if (
-			prev === 'running' &&
-			(status === 'completed' || status === 'error' || status === 'stopped') &&
-			history.length > 0 &&
-			currentTask
-		) {
-			saveSession({ task: currentTask, history, status }).catch((err) =>
-				console.error('[SidePanel] Failed to save session:', err)
-			)
-		}
-	}, [status, history, currentTask])
-
 	// Auto-scroll to bottom on new events
 	useEffect(() => {
 		if (historyRef.current) {
@@ -72,11 +54,22 @@ export default function App() {
 			const normalizedTask = task.trim()
 			if (!normalizedTask || (status === 'running' && !waitingForUser)) return
 
-			setInputValue('')
+			setSubmitError(null)
 			setView({ name: 'chat' })
-
-			const operation = waitingForUser ? reply(normalizedTask) : execute(normalizedTask)
-			operation.catch((error) => {
+			if (waitingForUser) {
+				void reply(normalizedTask)
+					.then(() => setInputValue(''))
+					.catch((error: unknown) => {
+						const message = error instanceof Error ? error.message : String(error)
+						setSubmitError(message)
+						console.error('[SidePanel] Failed to reply to session:', error)
+					})
+				return
+			}
+			setInputValue('')
+			void execute(normalizedTask).catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error)
+				setSubmitError(message)
 				console.error('[SidePanel] Failed to execute task:', error)
 			})
 		},
@@ -208,12 +201,20 @@ export default function App() {
 
 			{/* Input */}
 			<footer className="border-t p-3">
+				{submitError && (
+					<p role="alert" className="mb-2 text-xs text-destructive">
+						{submitError}
+					</p>
+				)}
 				<InputGroup className="relative rounded-lg">
 					<InputGroupTextarea
 						ref={textareaRef}
 						placeholder="Describe your task... (Enter to send)"
 						value={inputValue}
-						onChange={(e) => setInputValue(e.target.value)}
+						onChange={(e) => {
+							setInputValue(e.target.value)
+							if (submitError) setSubmitError(null)
+						}}
 						onKeyDown={handleKeyDown}
 						disabled={isRunning && !waitingForUser}
 						className="text-xs pr-12 min-h-10"

@@ -5,7 +5,7 @@
  */
 import { useSessionAgent } from './useSessionAgent'
 
-export type { AdvancedConfig, ExtConfig, LanguagePreference } from './config'
+export type { ExtConfig, LanguagePreference } from './config'
 export type { UseSessionAgentResult as UseAgentResult } from './useSessionAgent'
 
 export function useAgent() {

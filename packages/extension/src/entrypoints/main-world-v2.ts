@@ -1,5 +1,6 @@
 import type {
 	Capability,
+	JsonValue,
 	PublicApiRequest,
 	PublicApiResponse,
 	PublicSessionEvent,
@@ -9,7 +10,7 @@ import type {
 interface PublicSession {
 	sessionId: string
 	onEvent(listener: (event: PublicSessionEvent) => void): () => void
-	result: Promise<{ status: string; summary?: string }>
+	result: Promise<{ status: string; summary?: string; data?: JsonValue }>
 	cancel(): Promise<void>
 	reply(text: string): Promise<void>
 }
@@ -99,7 +100,7 @@ export default defineUnlistedScript(() => {
 					if (sessionListeners.size === 0) listeners.delete(sessionId)
 				}
 			},
-			result: request<{ status: string; summary?: string }>({
+			result: request<{ status: string; summary?: string; data?: JsonValue }>({
 				type: 'session.result',
 				requestId: nextId('result'),
 				origin: window.location.origin,

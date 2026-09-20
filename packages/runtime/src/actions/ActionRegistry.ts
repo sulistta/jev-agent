@@ -57,7 +57,7 @@ const definitions: Record<ActionName, ActionDefinition> = {
 		type: 'tab.close',
 		requiredCapability: 'tabs.write',
 		risk: 'R2',
-		confirmationRequired: true,
+		confirmationRequired: false,
 	},
 }
 

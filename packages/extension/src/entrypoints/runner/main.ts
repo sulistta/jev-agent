@@ -1,21 +1,14 @@
 import {
 	DEFAULT_TYPESAFE_JEV_MODEL,
-	DEFAULT_VERCEL_JEV_MODEL,
 	DirectHttpJevTransport,
 	JevDecisionProvider,
 	JevDecisionRouter,
 	JevTaskRouter,
 	RetryingJevTransport,
 	SeedThresholdPolicy,
-	VercelGatewayJevTransport,
 } from '@page-agent/decision-jev'
 import type { PublicSessionStartPayload } from '@page-agent/protocol'
-import type {
-	DecisionRouter,
-	GoalContract,
-	SemanticTextProvider,
-	TaskRouter,
-} from '@page-agent/runtime'
+import type { DecisionRouter, SemanticTextProvider, TaskRouter } from '@page-agent/runtime'
 
 import type { RunnerRequestPayload } from '@/agent/RunnerPort.background'
 import { ChromeRuntimeRpc } from '@/runtime/ChromeRuntimeRpc'
@@ -23,32 +16,87 @@ import { ExtensionBrowserRuntime } from '@/runtime/ExtensionBrowserRuntime'
 import { OpenAiCompatibleSemanticTextProvider } from '@/runtime/OpenAiCompatibleSemanticTextProvider'
 import { createRunnerHost } from '@/runtime/RunnerHost'
 
-const port = chrome.runtime.connect({ name: 'page-agent-runner-v2' })
 const handles = new Map<string, import('@page-agent/runtime').SessionHandle>()
+let backgroundPort: chrome.runtime.Port | undefined
+let reconnectTimer: ReturnType<typeof setTimeout> | undefined
+const pendingEvents: unknown[] = []
 
-port.onMessage.addListener((message: unknown) => {
-	if (!isRunnerRequest(message)) return
-	void handle(message.payload)
-		.then((value) =>
-			port.postMessage({
-				type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
-				requestId: message.requestId,
-				ok: true,
-				value,
+function connectBackground(): void {
+	if (backgroundPort) return
+	const port = chrome.runtime.connect({ name: 'page-agent-runner-v2' })
+	backgroundPort = port
+	port.onMessage.addListener((message: unknown) => {
+		if (!isRunnerRequest(message)) return
+		void handle(message.payload)
+			.then((value) => {
+				postResponse(port, {
+					type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
+					requestId: message.requestId,
+					ok: true,
+					value,
+				})
 			})
-		)
-		.catch((error: unknown) =>
-			port.postMessage({
-				type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
-				requestId: message.requestId,
-				ok: false,
-				error: {
-					code: 'RUNNER_ERROR',
-					message: error instanceof Error ? error.message : String(error),
-				},
+			.catch((error: unknown) => {
+				postResponse(port, {
+					type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
+					requestId: message.requestId,
+					ok: false,
+					error: {
+						code: 'RUNNER_ERROR',
+						message: error instanceof Error ? error.message : String(error),
+					},
+				})
 			})
-		)
-})
+	})
+	port.onDisconnect.addListener(() => {
+		if (backgroundPort !== port) return
+		backgroundPort = undefined
+		if (reconnectTimer !== undefined) clearTimeout(reconnectTimer)
+		reconnectTimer = setTimeout(() => {
+			reconnectTimer = undefined
+			connectBackground()
+		}, 100)
+	})
+	flushPendingEvents()
+}
+
+function postResponse(port: chrome.runtime.Port, message: unknown): void {
+	// A response belongs to the background request that arrived on this exact
+	// connection. If it disconnected, that request has already been rejected.
+	if (backgroundPort !== port) return
+	try {
+		port.postMessage(message)
+	} catch {
+		// The disconnect listener reconnects the control channel.
+	}
+}
+
+function postEvent(message: unknown): void {
+	const port = backgroundPort
+	if (!port) {
+		pendingEvents.push(message)
+		return
+	}
+	try {
+		port.postMessage(message)
+	} catch {
+		pendingEvents.push(message)
+	}
+}
+
+function flushPendingEvents(): void {
+	const port = backgroundPort
+	if (!port) return
+	while (pendingEvents.length > 0) {
+		const event = pendingEvents[0]
+		try {
+			port.postMessage(event)
+			pendingEvents.shift()
+		} catch {
+			return
+		}
+	}
+}
 
 async function handle(payload: RunnerRequestPayload): Promise<unknown> {
 	switch (payload.type) {
@@ -57,7 +105,7 @@ async function handle(payload: RunnerRequestPayload): Promise<unknown> {
 				request: payload.input.task,
 				owner: { kind: 'external_client', ownerId: payload.input.origin },
 				capabilities: payload.input.capabilities as import('@page-agent/runtime').Capability[],
-				goals: [genericGoal(payload.input.task)],
+				goals: [],
 				initialTabId: payload.input.initialTabId,
 			})
 			handles.set(handle.id, handle)
@@ -82,19 +130,17 @@ async function handle(payload: RunnerRequestPayload): Promise<unknown> {
 		case 'session.result': {
 			const handle = handles.get(payload.input.sessionId)
 			const result = handle ? await handle.result : await host.manager.get(payload.input.sessionId)
-			return result ? { status: result.status, summary: result.finalResponse } : undefined
+			return result
+				? { status: result.status, summary: result.finalResponse, data: result.data }
+				: undefined
 		}
 	}
 }
 
 async function forwardEvents(sessionId: string): Promise<void> {
-	try {
-		for await (const event of host.manager.subscribe(sessionId)) {
-			port.postMessage({ type: 'PAGE_AGENT_V2_RUNNER_EVENT', sessionId, event })
-			if (event.type === 'session.terminal') break
-		}
-	} catch {
-		// The background port may disconnect while the runner is still finishing.
+	for await (const event of host.manager.subscribe(sessionId)) {
+		postEvent({ type: 'PAGE_AGENT_V2_RUNNER_EVENT', sessionId, event })
+		if (event.type === 'session.terminal') break
 	}
 }
 
@@ -140,20 +186,12 @@ class LazyProviders {
 		const provider = new JevDecisionProvider({
 			model: normalizeJevModel(stored.jevConfig),
 			transport: new RetryingJevTransport(
-				stored.jevConfig.provider === 'vercel'
-					? new VercelGatewayJevTransport({
-							endpoint: stored.jevConfig.endpoint,
-							model: normalizeJevModel(stored.jevConfig),
-							apiKey: stored.jevConfig.apiKey,
-						})
-					: new DirectHttpJevTransport({
-							endpoint: stored.jevConfig.endpoint,
-							apiKey: stored.jevConfig.apiKey,
-						})
+				new DirectHttpJevTransport({
+					endpoint: stored.jevConfig.endpoint,
+					apiKey: stored.jevConfig.apiKey,
+				})
 			),
 			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: stored.jevConfig.languagePolicy ?? 'preserve',
-			maxStateBytes: 24_000,
 			telemetry: 'redacted',
 		})
 		return {
@@ -176,10 +214,25 @@ class LazyTaskRouter implements TaskRouter {
 	async route(...args: Parameters<TaskRouter['route']>) {
 		return (await this.providers.get()).taskRouter.route(...args)
 	}
+	async shouldClarify(...args: Parameters<NonNullable<TaskRouter['shouldClarify']>>) {
+		const router = (await this.providers.get()).taskRouter
+		return router.shouldClarify ? router.shouldClarify(...args) : true
+	}
 }
 
 class LazySemanticTextProvider implements SemanticTextProvider {
 	constructor(private readonly providers: LazyProviders) {}
+	async plan(...args: Parameters<NonNullable<SemanticTextProvider['plan']>>) {
+		const provider = (await this.providers.get()).semanticText
+		if (!provider.plan) throw new Error('Semantic model does not support typed task planning')
+		return provider.plan(...args)
+	}
+	async extract(...args: Parameters<NonNullable<SemanticTextProvider['extract']>>) {
+		const provider = (await this.providers.get()).semanticText
+		if (!provider.extract)
+			throw new Error('Semantic model does not support typed evidence extraction')
+		return provider.extract(...args)
+	}
 	async generate(...args: Parameters<SemanticTextProvider['generate']>) {
 		return (await this.providers.get()).semanticText.generate(...args)
 	}
@@ -203,7 +256,6 @@ interface StoredLlmConfig {
 	baseURL: string
 	model: string
 	apiKey?: string
-	disableNamedToolChoice?: boolean
 }
 
 function isLlmConfig(value: unknown): value is StoredLlmConfig {
@@ -215,9 +267,7 @@ function isLlmConfig(value: unknown): value is StoredLlmConfig {
 		return (
 			['http:', 'https:'].includes(url.protocol) &&
 			candidate.model.trim().length > 0 &&
-			(candidate.apiKey === undefined || typeof candidate.apiKey === 'string') &&
-			(candidate.disableNamedToolChoice === undefined ||
-				typeof candidate.disableNamedToolChoice === 'boolean')
+			(candidate.apiKey === undefined || typeof candidate.apiKey === 'string')
 		)
 	} catch {
 		return false
@@ -225,11 +275,9 @@ function isLlmConfig(value: unknown): value is StoredLlmConfig {
 }
 
 interface StoredJevConfig {
-	provider?: 'typesafe' | 'vercel'
 	endpoint: string
 	model: string
 	apiKey?: string
-	languagePolicy?: 'preserve' | 'english_questions' | 'normalized_bilingual'
 }
 
 function isJevConfig(value: unknown): value is StoredJevConfig {
@@ -243,20 +291,12 @@ function isJevConfig(value: unknown): value is StoredJevConfig {
 		return false
 	}
 	return (
-		(candidate.provider === undefined ||
-			candidate.provider === 'typesafe' ||
-			candidate.provider === 'vercel') &&
 		candidate.model.trim().length > 0 &&
-		(candidate.apiKey === undefined || typeof candidate.apiKey === 'string') &&
-		(candidate.languagePolicy === undefined ||
-			['preserve', 'english_questions', 'normalized_bilingual'].includes(
-				candidate.languagePolicy as string
-			))
+		(candidate.apiKey === undefined || typeof candidate.apiKey === 'string')
 	)
 }
 
 function normalizeJevModel(config: StoredJevConfig): string {
-	if (config.provider === 'vercel') return DEFAULT_VERCEL_JEV_MODEL
 	if (config.model.trim() === 'jev' || config.model.trim() === 'jev-1.13')
 		return DEFAULT_TYPESAFE_JEV_MODEL
 	return config.model.trim() || DEFAULT_TYPESAFE_JEV_MODEL
@@ -269,17 +309,6 @@ const host = createRunnerHost({
 	taskRouter: new LazyTaskRouter(providers),
 	semanticText: new LazySemanticTextProvider(providers),
 })
-
-function genericGoal(task: string): GoalContract {
-	return {
-		goalId: 'goal-public-1',
-		description: task,
-		required: true,
-		outcome: { kind: 'predicate', predicate: { kind: 'element.present', label: task } },
-		status: 'pending',
-		evidenceIds: [],
-	}
-}
 
 function isRunnerRequest(value: unknown): value is {
 	type: 'PAGE_AGENT_V2_RUNNER_REQUEST'
@@ -296,6 +325,6 @@ function isRunnerRequest(value: unknown): value is {
 	)
 }
 
-void chrome.runtime.sendMessage({ type: 'PAGE_AGENT_V2_RUNNER_READY' })
+connectBackground()
 
 export type { PublicSessionStartPayload }

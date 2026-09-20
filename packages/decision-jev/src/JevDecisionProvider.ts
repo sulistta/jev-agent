@@ -1,7 +1,7 @@
 import type { ActionName, RiskTier } from '@page-agent/browser'
 import type { JsonValue } from '@page-agent/protocol'
 
-import type { LanguagePolicy, ThresholdPolicy } from './gates'
+import type { ThresholdPolicy } from './gates'
 import { routeByConfidence } from './gates'
 import { type QuestionTemplate, candidateSelectTemplate } from './questions'
 import { jsonStateBytes } from './transports'
@@ -17,8 +17,6 @@ export interface JevDecisionProviderConfig {
 	model: string
 	transport: JevTransport
 	thresholds: ThresholdPolicy
-	languagePolicy: LanguagePolicy
-	maxStateBytes: number
 	telemetry: 'off' | 'metadata' | 'redacted'
 	template?: QuestionTemplate
 }
@@ -37,25 +35,75 @@ export class JevDecisionProvider {
 		context: JevDecisionContext & { requestId: string },
 		signal: AbortSignal
 	): Promise<JevDecisionResult> {
-		const stateBytes = jsonStateBytes(context.state)
-		if (stateBytes > this.config.maxStateBytes)
-			return {
+		const results = await this.decideMany(
+			{
+				requestId: context.requestId,
+				state: context.state,
+				judgments: [{ ...context, questionId: context.questionId ?? this.template.id }],
+			},
+			signal
+		)
+		return (
+			results[context.questionId ?? this.template.id] ?? {
 				status: 'invalid',
-				reason: `Jev state budget exceeded (${stateBytes} bytes; limit ${this.config.maxStateBytes}). Reduce the observation size.`,
+				reason: 'Jev response omitted the requested question',
 			}
-		const question = this.template.build(context.state, context.options)
+		)
+	}
+
+	async decideMany(
+		input: {
+			requestId: string
+			state: JsonValue
+			judgments: (Omit<JevDecisionContext, 'state'> & { questionId: string })[]
+		},
+		signal: AbortSignal
+	): Promise<Record<string, JevDecisionResult>> {
+		const stateBytes = jsonStateBytes(input.state)
+		const questions = input.judgments.map((judgment) => {
+			const question = this.template.build(input.state, judgment.options)
+			return {
+				...question,
+				questionId: judgment.questionId,
+				primitive: judgment.primitive ?? question.primitive,
+				...(judgment.prompt ? { prompt: judgment.prompt } : {}),
+				...(judgment.allowNone !== undefined ? { allowNone: judgment.allowNone } : {}),
+			}
+		})
 		const request: JevRequest = {
-			requestId: context.requestId,
+			requestId: input.requestId,
 			model: this.config.model,
-			questions: [question],
-			language: this.config.languagePolicy,
+			questions,
+			language: 'preserve',
 			stateBytes,
 		}
 		const response = await this.config.transport.systemOne(request, signal)
-		const answer = response.answers.find(
-			(candidate) => candidate.questionId === question.questionId
+		return Object.fromEntries(
+			input.judgments.map((judgment, index) => {
+				const question = questions[index]
+				const answer = response.answers.find(
+					(candidate) => candidate.questionId === question.questionId
+				)
+				return [judgment.questionId, this.routeAnswer(judgment, question, answer)]
+			})
 		)
+	}
+
+	private routeAnswer(
+		context: Omit<JevDecisionContext, 'state'>,
+		question: ReturnType<QuestionTemplate['build']>,
+		answer: JevDecisionResult['answer']
+	): JevDecisionResult {
 		if (!answer) return { status: 'invalid', reason: 'Jev response omitted the requested question' }
+		if (question.primitive === 'noul') {
+			if (typeof answer.value !== 'number' || !Number.isFinite(answer.value))
+				return { status: 'invalid', answer, reason: 'Jev Noul answer has no probability' }
+			return {
+				status: answer.value > 0.5 ? 'selected' : 'none',
+				answer,
+				confidence: answer.confidence,
+			}
+		}
 		const confidence = answer.confidence
 		const threshold = this.config.thresholds.resolve({
 			questionTemplate: question.templateId,

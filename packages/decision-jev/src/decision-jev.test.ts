@@ -3,12 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { JevDecisionProvider } from './JevDecisionProvider'
 import { SeedThresholdPolicy, routeByConfidence } from './gates'
 import { QuestionTemplateRegistry, candidateSelectTemplate } from './questions'
-import {
-	DirectHttpJevTransport,
-	MockJevTransport,
-	RetryingJevTransport,
-	VercelGatewayJevTransport,
-} from './transports'
+import { DirectHttpJevTransport, MockJevTransport, RetryingJevTransport } from './transports'
 import { JevTransportError } from './types'
 
 const requestContext = {
@@ -45,8 +40,6 @@ describe('@page-agent/decision-jev', () => {
 			model: 'jev-test',
 			transport,
 			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 10_000,
 			telemetry: 'metadata',
 		})
 		expect(await provider.decide(requestContext, new AbortController().signal)).toMatchObject({
@@ -67,8 +60,6 @@ describe('@page-agent/decision-jev', () => {
 				],
 			}),
 			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 10_000,
 			telemetry: 'off',
 		}).decide(requestContext, new AbortController().signal)
 		expect(low.status).toBe('none')
@@ -78,6 +69,53 @@ describe('@page-agent/decision-jev', () => {
 				new SeedThresholdPolicy().resolve({ questionTemplate: 'candidate.select', risk: 'R1' })
 			)
 		).toBe('verify')
+	})
+
+	it('batches independent judgments into one System One request', async () => {
+		const transport = new MockJevTransport((request) => ({
+			requestId: request.requestId,
+			answers: request.questions.map((question, index) => ({
+				questionId: question.questionId,
+				selectedOptionId: index === 0 ? 'click' : 'candidate-1',
+				confidence: 0.95,
+			})),
+		}))
+		const provider = new JevDecisionProvider({
+			model: 'jev-test',
+			transport,
+			thresholds: new SeedThresholdPolicy(),
+			telemetry: 'off',
+		})
+
+		const result = await provider.decideMany(
+			{
+				requestId: 'batch-1',
+				state: { goal: 'save the form' },
+				judgments: [
+					{
+						questionId: 'operation',
+						need: 'select_operation',
+						risk: 'R1',
+						options: [{ id: 'click', label: 'Click a control' }],
+					},
+					{
+						questionId: 'click_target',
+						need: 'select_candidate',
+						risk: 'R1',
+						options: [{ id: 'candidate-1', label: 'Save' }],
+					},
+				],
+			},
+			new AbortController().signal
+		)
+
+		expect(transport.requests).toHaveLength(1)
+		expect(transport.requests[0].questions.map((question) => question.questionId)).toEqual([
+			'operation',
+			'click_target',
+		])
+		expect(result.operation.selectedOptionId).toBe('click')
+		expect(result.click_target.selectedOptionId).toBe('candidate-1')
 	})
 
 	it('retries only retryable transport errors with the same request', async () => {
@@ -130,6 +168,32 @@ describe('@page-agent/decision-jev', () => {
 		expect(fetchImpl).toHaveBeenCalledWith(
 			'https://jev.test/system-one',
 			expect.objectContaining({ method: 'POST' })
+		)
+	})
+
+	it('reports provider context rejection without hiding candidate loss', async () => {
+		const transport = new DirectHttpJevTransport({
+			endpoint: 'https://api.typesafe.ai/v1/systemone',
+			fetchImpl: vi.fn(
+				async () =>
+					new Response(JSON.stringify({ detail: 'context exceeds 64k tokens' }), {
+						status: 422,
+					})
+			),
+		})
+		await expect(
+			transport.systemOne(
+				{
+					requestId: 'request-context',
+					model: 'test',
+					questions: [],
+					language: 'preserve',
+					stateBytes: 70_000,
+				},
+				new AbortController().signal
+			)
+		).rejects.toThrow(
+			'Jev HTTP 422. The provider rejected the complete candidate context; no candidates were truncated. Provider response: {"detail":"context exceeds 64k tokens"}'
 		)
 	})
 
@@ -222,57 +286,52 @@ describe('@page-agent/decision-jev', () => {
 		})
 	})
 
-	it('calls Vercel AI Gateway evaluation instead of an OpenAI-compatible endpoint', async () => {
-		const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-			expect(input).toBe('https://ai-gateway.vercel.sh/v4/ai/evaluation-model')
-			expect(init?.headers).toMatchObject({
-				'ai-model-id': 'typesafe-ai/jev',
-				'ai-evaluation-model-specification-version': '4',
-			})
+	it('maps parallel Noul questions through one native TypeSafe request', async () => {
+		const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
 			const body = JSON.parse(init?.body as string) as Record<string, any>
-			expect(body.questions['candidate.select'].type).toBe('choice')
+			expect(body.state).toEqual({ candidates: ['first', 'last'] })
+			expect(body.questions).toEqual({
+				'candidate:0': { type: 'noul', instructions: 'Is candidate 0 suitable?' },
+				'candidate:1': { type: 'noul', instructions: 'Is candidate 1 suitable?' },
+			})
 			return new Response(
 				JSON.stringify({
 					answers: {
-						'candidate.select': {
-							type: 'choice',
-							choice: 'candidate-1',
-							probabilities: { 'candidate-1': 0.91, none_of_the_above: 0.09 },
-						},
+						'candidate:0': { type: 'noul', noul: 0.1 },
+						'candidate:1': { type: 'noul', noul: 0.91 },
 					},
 				}),
 				{ status: 200 }
 			)
 		})
-		const transport = new VercelGatewayJevTransport({
-			endpoint: 'https://ai-gateway.vercel.sh',
-			apiKey: 'gateway-key',
+		const transport = new DirectHttpJevTransport({
+			endpoint: 'https://api.typesafe.ai/v1/',
 			fetchImpl,
 		})
 		await expect(
 			transport.systemOne(
 				{
-					requestId: 'request-1',
-					model: 'typesafe-ai/jev',
-					questions: [
-						{
-							questionId: 'candidate.select',
-							templateId: 'candidate.select',
-							templateVersion: 'v1',
-							primitive: 'choice',
-							prompt: 'Which candidate?',
-							state: { goal: 'click save' },
-							options: requestContext.options,
-							allowNone: true,
-						},
-					],
+					requestId: 'noul-batch',
+					model: 'jev-latest',
+					questions: [0, 1].map((index) => ({
+						questionId: `candidate:${index}`,
+						templateId: 'candidate.select',
+						templateVersion: 'v1',
+						primitive: 'noul' as const,
+						prompt: `Is candidate ${index} suitable?`,
+						state: { candidates: ['first', 'last'] },
+					})),
 					language: 'preserve',
-					stateBytes: 20,
+					stateBytes: 31,
 				},
 				new AbortController().signal
 			)
 		).resolves.toMatchObject({
-			answers: [{ selectedOptionId: 'candidate-1', confidence: 0.91 }],
+			answers: [
+				{ questionId: 'candidate:0', value: 0.1 },
+				{ questionId: 'candidate:1', value: 0.91 },
+			],
 		})
+		expect(fetchImpl).toHaveBeenCalledOnce()
 	})
 })

@@ -88,4 +88,33 @@ describe('DefaultPolicyEngine', () => {
 			)
 		).resolves.toBe('allow')
 	})
+
+	it('enforces the session tab ownership limit without an extra confirmation class', async () => {
+		await expect(
+			policy.authorize(
+				{
+					session: {
+						...session,
+						browserScope: {
+							...session.browserScope,
+							ownedTabIds: ['tab-1'],
+							maxTabs: 1,
+						},
+					},
+					decision: decision({ type: 'tab.open', url: 'https://example.test/new' }),
+				},
+				new AbortController().signal
+			)
+		).resolves.toBe('deny')
+
+		await expect(
+			policy.authorize(
+				{
+					session,
+					decision: decision({ type: 'tab.close', tabId: 'tab-1' }),
+				},
+				new AbortController().signal
+			)
+		).resolves.toBe('allow')
+	})
 })

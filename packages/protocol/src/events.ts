@@ -1,4 +1,5 @@
 import type { SessionId } from './ids'
+import type { JsonValue } from './json'
 
 export type WireSessionStatus =
 	| 'created'
@@ -20,6 +21,7 @@ export interface SessionStatusPayload {
 export interface SessionResultPayload {
 	status: Exclude<WireSessionStatus, 'created' | 'running' | 'waiting_user' | 'paused'>
 	summary?: string
+	data?: JsonValue
 }
 
 export interface SessionEventPayloads {

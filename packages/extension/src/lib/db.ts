@@ -8,7 +8,7 @@ export interface SessionRecord {
 	id: string
 	task: string
 	history: HistoricalEvent[]
-	status: 'completed' | 'error' | 'stopped'
+	status: 'running' | 'waiting_user' | 'completed' | 'error' | 'stopped'
 	createdAt: number
 }
 
@@ -45,6 +45,12 @@ export async function saveSession(
 	}
 	await db.put('sessions', record)
 	return record
+}
+
+export async function upsertSession(session: SessionRecord): Promise<SessionRecord> {
+	const db = await getDB()
+	await db.put('sessions', session)
+	return session
 }
 
 /** List sessions, newest first */

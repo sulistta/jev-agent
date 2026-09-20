@@ -60,6 +60,11 @@ describe('SessionProjection', () => {
 		])
 	})
 
+	it('confirms that a session reply was accepted without persisting its text', () => {
+		const history = projectSessionEvent([], event('user.reply', { received: 'true' }))
+		expect(history).toEqual([{ type: 'observation', content: 'Reply received. Continuing task.' }])
+	})
+
 	it('shows the browser error that caused an action to fail', () => {
 		const started = projectSessionEvent([], event('action.started', { actionType: 'input' }))
 		const completed = projectSessionEvent(

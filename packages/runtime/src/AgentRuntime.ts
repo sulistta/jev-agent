@@ -5,7 +5,16 @@ import type {
 	PageObservation,
 } from '@page-agent/browser'
 
-import type { ExecutionBudgets, GoalContract, GoalStatus, Session, SessionStatus } from './domain'
+import type {
+	EvidenceItem,
+	ExecutionBudgets,
+	GoalContract,
+	GoalStatus,
+	Session,
+	SessionStatus,
+	TaskPlan,
+	TaskWorkItem,
+} from './domain'
 import { type RuntimeError } from './errors/RuntimeError'
 import { type RuntimeDependencies, createDefaultBudgets, createTaskContract } from './ports'
 import { isTerminalSessionStatus, transitionSession } from './session/state'
@@ -13,7 +22,7 @@ import { isTerminalSessionStatus, transitionSession } from './session/state'
 export interface StartTaskInput {
 	request: string
 	owner: import('./domain').SessionOwner
-	goals: import('./domain').GoalContract[]
+	goals?: import('./domain').GoalContract[]
 	capabilities?: import('./domain').Capability[]
 	budgets?: Partial<ExecutionBudgets>
 	/** The browser tab that owns the first observation for extension sessions. */
@@ -27,6 +36,7 @@ export interface SessionSnapshot {
 	currentGoalId?: string
 	pendingConfirmationId?: string
 	finalResponse?: string
+	data?: { plan?: TaskPlan; evidence: EvidenceItem[] }
 }
 
 export interface SessionHandle {
@@ -81,7 +91,7 @@ class DefaultAgentRuntime implements AgentRuntime {
 		const task = createTaskContract({
 			taskId: this.dependencies.ids.next('task'),
 			request: input.request,
-			goals: input.goals,
+			goals: input.goals ?? [],
 			createdAt,
 			allowedCapabilities: input.capabilities,
 		})
@@ -222,7 +232,9 @@ class SessionExecution implements SessionHandle {
 				{ role: 'user', text: value, at: this.dependencies.clock.now() },
 			],
 		})
-		await this.emit(session.sessionId, 'user.reply', { text: value })
+		// Replies remain in session-local conversation memory. The event log records only receipt so
+		// user-supplied values are not duplicated into diagnostics or public projections.
+		await this.emit(session.sessionId, 'user.reply', { received: 'true' })
 		await this.resume()
 	}
 
@@ -272,22 +284,27 @@ class SessionExecution implements SessionHandle {
 				await this.emit(session.sessionId, 'task.routed', { mode: taskMode })
 			}
 			if (session.taskMode === 'conversation') return await this.completeConversation(session)
+			session = await this.prepareBrowserSession(session)
 
 			let steps = 0
 			let actions = 0
 			let noProgress = 0
+			let stateBeforeLastExecutedAction: string | undefined
 
 			while (true) {
 				await this.waitUntilRunnable()
 				session = await this.currentSession()
 				this.assertNotCancelled()
-				if (this.elapsedMs() >= session.budgets.maxElapsedMs) {
+				if (session.budgets.maxElapsedMs > 0 && this.elapsedMs() >= session.budgets.maxElapsedMs) {
 					return await this.block(session, 'BUDGET_EXCEEDED', 'Execution deadline exceeded')
 				}
 
 				const goal = nextGoal(session)
 				if (!goal) return await this.finishWithoutPendingGoals(session)
-				if (steps >= session.budgets.maxSteps || actions >= session.budgets.maxActions) {
+				if (
+					(session.budgets.maxSteps > 0 && steps >= session.budgets.maxSteps) ||
+					(session.budgets.maxActions > 0 && actions >= session.budgets.maxActions)
+				) {
 					return await this.block(session, 'BUDGET_EXCEEDED', 'Execution budget exceeded')
 				}
 
@@ -295,7 +312,20 @@ class SessionExecution implements SessionHandle {
 					session = await this.updateGoal(session, goal.goalId, 'active')
 				steps += 1
 
-				const observation = await this.observe(session)
+				session = await this.setPhase(session, 'observing')
+				const observation = await this.observe(session, workItemForGoal(session.plan, goal.goalId))
+				const observationFingerprint = runtimeObservationFingerprint(observation)
+				if (stateBeforeLastExecutedAction !== undefined) {
+					noProgress = stateBeforeLastExecutedAction === observationFingerprint ? noProgress + 1 : 0
+					stateBeforeLastExecutedAction = undefined
+				}
+				session = await this.collectEvidence(session, goal, observation)
+				if (researchGoalSatisfied(session, goal.goalId)) {
+					session = await this.updateGoal(session, goal.goalId, 'satisfied')
+					noProgress = 0
+					continue
+				}
+				session = await this.setPhase(session, 'verifying')
 				const verification = await this.dependencies.verifier.verify(
 					{ goal, observation },
 					this.abortController.signal
@@ -312,7 +342,14 @@ class SessionExecution implements SessionHandle {
 				}
 				if (verification.status === 'failed' && goal.required)
 					return await this.fail(session, 'Goal verification failed')
+				if (noProgress >= session.budgets.maxConsecutiveNoProgress)
+					return await this.block(
+						session,
+						'NO_PROGRESS',
+						'The page state did not change after repeated completed actions'
+					)
 
+				session = await this.setPhase(session, 'deciding')
 				const decision = await this.dependencies.decisions.decide(
 					{
 						session,
@@ -333,8 +370,21 @@ class SessionExecution implements SessionHandle {
 					reason: decision.reason ?? '',
 					candidateId: decision.candidateId ?? '',
 				})
+				if (decision.fingerprint && !session.decisionFingerprints?.includes(decision.fingerprint))
+					session = await this.save({
+						...session,
+						decisionFingerprints: [
+							...(session.decisionFingerprints ?? []),
+							decision.fingerprint,
+						].slice(-100),
+					})
 
 				if (decision.kind === 'goal_satisfied') {
+					const workItem = workItemForGoal(session.plan, goal.goalId)
+					if (workItem?.kind === 'research' && !researchGoalSatisfied(session, goal.goalId)) {
+						noProgress += 1
+						continue
+					}
 					session = await this.updateGoal(session, goal.goalId, 'satisfied', decision.evidence)
 					noProgress = 0
 					continue
@@ -457,6 +507,7 @@ class SessionExecution implements SessionHandle {
 				if (authorization === 'deny')
 					return await this.block(session, 'POLICY_BLOCKED', 'Policy denied action')
 
+				session = await this.setPhase(session, 'executing')
 				await this.emit(session.sessionId, 'action.started', {
 					actionId,
 					actionType: action.type,
@@ -481,21 +532,23 @@ class SessionExecution implements SessionHandle {
 								ownedTabIds: [...new Set([...session.browserScope.ownedTabIds, effect.tabId])],
 							},
 						})
+					} else if (effect.type === 'tab.closed') {
+						const ownedTabIds = session.browserScope.ownedTabIds.filter(
+							(tabId) => tabId !== effect.tabId
+						)
+						session = await this.save({
+							...session,
+							browserScope: {
+								...session.browserScope,
+								ownedTabIds,
+								activeTabId:
+									session.browserScope.activeTabId === effect.tabId
+										? ownedTabIds.at(-1)
+										: session.browserScope.activeTabId,
+							},
+						})
 					}
 				}
-				const synchronization = await this.dependencies.browser.waitFor(
-					{
-						sessionId: session.sessionId,
-						tabId: session.browserScope.activeTabId ?? 'in-page',
-						since: receipt.startedAt,
-						expected: expectedChanges(action),
-						settle: { quietWindowMs: 200, maxWaitMs: 3_000 },
-					},
-					this.abortController.signal
-				)
-				await this.emit(session.sessionId, 'synchronization.completed', {
-					status: synchronization.status,
-				})
 				actions += 1
 				await this.emit(session.sessionId, 'action.completed', {
 					actionId: receipt.actionId,
@@ -505,8 +558,41 @@ class SessionExecution implements SessionHandle {
 					errorMessage: receipt.error?.message ?? '',
 					retryable: String(receipt.error?.retryable ?? false),
 				})
+				const journalEntry: import('./domain').ActionJournalEntry = {
+					actionId: receipt.actionId,
+					workItemId: goal.goalId,
+					action: action.type,
+					label: decision.candidateId ?? action.type,
+					status: receipt.status === 'executed' ? 'executed' : 'failed',
+					observationId: observation.observationId,
+					completedAt: receipt.endedAt,
+				}
+				session = await this.save({
+					...session,
+					actionJournal: [...(session.actionJournal ?? []), journalEntry].slice(-200),
+				})
+				session = await this.setPhase(session, 'settling')
+				const synchronization = tabEffectConfirmsAction(receipt, action)
+					? {
+							status: 'satisfied' as const,
+							signals: receipt.observedSignals,
+							endedAt: receipt.endedAt,
+						}
+					: await this.dependencies.browser.waitFor(
+							{
+								sessionId: session.sessionId,
+								tabId: session.browserScope.activeTabId ?? 'in-page',
+								since: receipt.startedAt,
+								expected: expectedChanges(action),
+								settle: { quietWindowMs: 500, maxWaitMs: 10_000 },
+							},
+							this.abortController.signal
+						)
+				await this.emit(session.sessionId, 'synchronization.completed', {
+					status: synchronization.status,
+				})
 				if (receipt.status === 'executed') {
-					noProgress = 0
+					stateBeforeLastExecutedAction = observationFingerprint
 					continue
 				}
 				noProgress += 1
@@ -536,7 +622,67 @@ class SessionExecution implements SessionHandle {
 		}
 	}
 
-	private async observe(session: Session): Promise<PageObservation> {
+	private async prepareBrowserSession(session: Session): Promise<Session> {
+		const semanticText = this.dependencies.semanticText
+		if (!semanticText?.plan) {
+			if (session.task.goals.length === 0)
+				throw new Error('Semantic model does not support typed task planning')
+			return session
+		}
+		while (true) {
+			if (!session.plan) {
+				session = await this.setPhase(session, 'planning')
+				const plan = await semanticText.plan(
+					{ request: session.task.request, conversation: session.conversation ?? [] },
+					this.abortController.signal
+				)
+				validatePlan(plan)
+				session = await this.save({
+					...session,
+					plan,
+					task: { ...session.task, goals: plan.workItems.map(goalFromWorkItem) },
+					decisionFingerprints: [],
+				})
+				await this.emit(session.sessionId, 'plan.created', {
+					workItems: String(plan.workItems.length),
+					missingInputs: String(plan.missingInputs.length),
+				})
+			}
+			const plan = session.plan
+			if (!plan) throw new Error('Task plan was not persisted')
+			if (plan.missingInputs.length === 0) return session
+			const shouldClarify = this.dependencies.taskRouter?.shouldClarify
+				? await this.dependencies.taskRouter.shouldClarify(
+						{ session, plan },
+						this.abortController.signal
+					)
+				: true
+			if (!shouldClarify) {
+				session = await this.save({
+					...session,
+					plan: { ...plan, missingInputs: [] },
+				})
+				await this.emit(session.sessionId, 'plan.clarification_deferred', {
+					count: String(plan.missingInputs.length),
+				})
+				return session
+			}
+			const question = plan.missingInputs.map((item) => item.question.trim()).join('\n')
+			session = await this.addAssistantMessage(
+				session,
+				requireSemanticText(question, 'clarification'),
+				'clarification'
+			)
+			session = await this.setPhase(session, 'waiting_user')
+			this.paused = true
+			await this.transition(session, 'waiting_user')
+			await this.waitUntilRunnable()
+			session = await this.currentSession()
+			session = await this.save({ ...session, plan: undefined })
+		}
+	}
+
+	private async observe(session: Session, workItem?: TaskWorkItem): Promise<PageObservation> {
 		if (!session.browserScope.activeTabId) {
 			const observation: PageObservation = {
 				observationId: `observation:unbound:${session.revision}`,
@@ -564,9 +710,9 @@ class SessionExecution implements SessionHandle {
 			{
 				sessionId: session.sessionId,
 				tabId: session.browserScope.activeTabId ?? 'in-page',
-				scope: 'document',
+				scope: workItem?.kind === 'research' ? 'document' : 'viewport',
 				includeText: true,
-				includeNonInteractive: false,
+				includeNonInteractive: workItem?.kind === 'research',
 				attributes: [],
 				sensitivityPolicyId: 'default',
 			},
@@ -579,6 +725,56 @@ class SessionExecution implements SessionHandle {
 			redactedFields: String(observation.sanitization.redactedFields),
 		})
 		return observation
+	}
+
+	private async collectEvidence(
+		session: Session,
+		goal: GoalContract,
+		observation: PageObservation
+	): Promise<Session> {
+		const plan = session.plan
+		const semanticText = this.dependencies.semanticText
+		const workItem = workItemForGoal(plan, goal.goalId)
+		if (
+			!plan ||
+			!semanticText?.extract ||
+			workItem?.kind !== 'research' ||
+			!observation.content?.length
+		)
+			return session
+		const fingerprint = extractionFingerprint(workItem.workItemId, observation)
+		if (session.extractionFingerprints?.includes(fingerprint)) return session
+		session = await this.setPhase(session, 'extracting')
+		const extracted = await semanticText.extract(
+			{
+				request: session.task.request,
+				plan,
+				workItemId: workItem.workItemId,
+				page: {
+					url: observation.page.url,
+					title: observation.page.title,
+					content: observation.content
+						.map((block) => `[${block.blockId}] ${block.text}`)
+						.join('\n'),
+				},
+			},
+			this.abortController.signal
+		)
+		const verified = extracted
+			.map((item) => verifyEvidenceItem(item, workItem.workItemId, observation))
+			.filter((item): item is EvidenceItem => item !== undefined)
+		const evidence = dedupeEvidence([...(session.evidence ?? []), ...verified])
+		const saved = await this.save({
+			...session,
+			evidence,
+			extractionFingerprints: [...(session.extractionFingerprints ?? []), fingerprint].slice(-500),
+		})
+		await this.emit(saved.sessionId, 'evidence.extracted', {
+			workItemId: workItem.workItemId,
+			extracted: String(extracted.length),
+			verified: String(verified.length),
+		})
+		return saved
 	}
 
 	private async updateGoal(
@@ -599,6 +795,14 @@ class SessionExecution implements SessionHandle {
 		const next = await this.save({
 			...session,
 			task: { ...session.task, goals },
+			plan: session.plan
+				? {
+						...session.plan,
+						workItems: session.plan.workItems.map((item) =>
+							item.workItemId === goalId ? { ...item, status } : item
+						),
+					}
+				: undefined,
 			currentGoalId: goalId,
 		})
 		await this.emit(session.sessionId, 'goal.updated', { goalId, status })
@@ -661,11 +865,18 @@ class SessionExecution implements SessionHandle {
 	}
 
 	private async addSummary(session: Session): Promise<Session> {
+		session = await this.setPhase(session, 'synthesizing')
 		const response = await this.dependencies.semanticText!.generate(
 			{
 				purpose: 'summary',
 				request: session.task.request,
 				conversation: session.conversation ?? [],
+				actionHistory: (session.actionJournal ?? []).map(({ action, label }) => ({
+					action,
+					label,
+				})),
+				plan: session.plan,
+				evidence: session.evidence,
 			},
 			this.abortController.signal
 		)
@@ -675,6 +886,13 @@ class SessionExecution implements SessionHandle {
 			'summary',
 			true
 		)
+	}
+
+	private async setPhase(session: Session, phase: NonNullable<Session['phase']>): Promise<Session> {
+		if (session.phase === phase) return session
+		const saved = await this.save({ ...session, phase })
+		await this.emit(saved.sessionId, 'execution.phase', { phase })
+		return saved
 	}
 
 	private async addAssistantMessage(
@@ -802,14 +1020,34 @@ function expectedChanges(action: BrowserAction): ExpectedChange[] {
 		case 'input':
 			return [{ type: 'target.value', targetLocalId: action.target.localId }, { type: 'dom' }]
 		case 'tab.open':
-			return [{ type: 'tab.created' }]
+			// The creation receipt identifies the new tab, but it does not mean the
+			// document or its content-script endpoint is ready. An empty expectation
+			// lets the target document settle for the normal quiet window first.
+			return []
 		case 'tab.switch':
 			return [{ type: 'tab.activated' }]
 		case 'tab.close':
 			return [{ type: 'tab.closed' }]
+		case 'click':
+			return [{ type: 'dom' }, { type: 'navigation' }]
 		default:
 			return [{ type: 'dom' }]
 	}
+}
+
+function tabEffectConfirmsAction(
+	receipt: import('@page-agent/browser').ActionReceipt,
+	action: BrowserAction
+): boolean {
+	if (!receipt.result?.ok) return false
+	const effect = receipt.result.effect
+	return (
+		(action.type === 'scroll' && effect.type === 'viewport.scrolled') ||
+		(action.type === 'tab.switch' &&
+			effect.type === 'tab.switched' &&
+			effect.tabId === action.tabId) ||
+		(action.type === 'tab.close' && effect.type === 'tab.closed' && effect.tabId === action.tabId)
+	)
 }
 
 function actionTarget(action: BrowserAction): ElementRef | undefined {
@@ -832,6 +1070,171 @@ function nextGoal(session: Session): GoalContract | undefined {
 	)
 }
 
+function goalFromWorkItem(workItem: TaskWorkItem): GoalContract {
+	return {
+		goalId: workItem.workItemId,
+		description: workItem.description,
+		required: workItem.required,
+		outcome: { kind: 'predicate', predicate: { kind: 'runtime.managed' } },
+		status: workItem.status,
+		evidenceIds: [],
+		dependsOn: workItem.dependsOn,
+	}
+}
+
+function workItemForGoal(plan: TaskPlan | undefined, goalId: string): TaskWorkItem | undefined {
+	return plan?.workItems.find((item) => item.workItemId === goalId)
+}
+
+function validatePlan(plan: TaskPlan): void {
+	if (plan.version !== 1 || !plan.canonicalGoal.trim() || plan.workItems.length === 0)
+		throw new Error('Semantic model returned an invalid task plan')
+	const ids = new Set<string>()
+	for (const item of plan.workItems) {
+		if (!item.workItemId.trim() || ids.has(item.workItemId))
+			throw new Error('Semantic model returned duplicate or empty work item IDs')
+		ids.add(item.workItemId)
+	}
+	for (const item of plan.workItems) {
+		if (
+			item.dependsOn.includes(item.workItemId) ||
+			item.dependsOn.some((dependency) => !ids.has(dependency))
+		)
+			throw new Error('Semantic model returned an invalid work item dependency')
+	}
+	const completed = new Set<string>()
+	while (completed.size < plan.workItems.length) {
+		const ready = plan.workItems.filter(
+			(item) =>
+				!completed.has(item.workItemId) &&
+				item.dependsOn.every((dependency) => completed.has(dependency))
+		)
+		if (ready.length === 0) throw new Error('Semantic model returned cyclic work item dependencies')
+		ready.forEach((item) => completed.add(item.workItemId))
+	}
+	for (const requirement of plan.coverage) {
+		if (!ids.has(requirement.workItemId) || requirement.minimum < 1)
+			throw new Error('Semantic model returned an invalid coverage requirement')
+	}
+	for (const item of plan.workItems.filter((candidate) => candidate.kind === 'research')) {
+		if (!plan.coverage.some((requirement) => requirement.workItemId === item.workItemId))
+			throw new Error(`Research work item has no coverage requirement: ${item.workItemId}`)
+	}
+}
+
+function researchGoalSatisfied(session: Session, goalId: string): boolean {
+	const workItem = workItemForGoal(session.plan, goalId)
+	if (!workItem || workItem.kind !== 'research' || !session.plan) return false
+	const requirements = session.plan.coverage.filter(
+		(requirement) => requirement.workItemId === workItem.workItemId
+	)
+	return (
+		requirements.length > 0 &&
+		requirements.every((requirement) => {
+			const matching = (session.evidence ?? []).filter(
+				(item) =>
+					item.workItemId === workItem.workItemId &&
+					item.verification === 'verified' &&
+					(requirement.requiredTags ?? []).every((tag) => item.tags.includes(tag))
+			)
+			if (!requirement.distinctBy) return matching.length >= requirement.minimum
+			const values = new Set(
+				matching
+					.map((item) => evidenceDistinctValue(item, requirement.distinctBy!))
+					.filter((value) => value !== undefined)
+					.map((value) => JSON.stringify(value))
+			)
+			return values.size >= requirement.minimum
+		})
+	)
+}
+
+function evidenceDistinctValue(
+	item: EvidenceItem,
+	field: string
+): import('@page-agent/protocol').JsonValue | undefined {
+	if (field === 'entityName') return item.entityName
+	if (field === 'source.origin' || field === 'origin') return item.source.origin
+	if (field === 'source.url' || field === 'url') return item.source.url
+	return item.attributes[field]
+}
+
+function extractionFingerprint(workItemId: string, observation: PageObservation): string {
+	return stableHash(
+		[
+			workItemId,
+			observation.page.url,
+			...(observation.content ?? []).map((block) => block.contentHash),
+		].join('\n')
+	)
+}
+
+function runtimeObservationFingerprint(observation: PageObservation): string {
+	return stableHash(
+		JSON.stringify({
+			page: observation.page,
+			content: (observation.content ?? []).map((block) => block.contentHash),
+			elements: observation.elements.map((element) => ({
+				tagName: element.tagName,
+				role: element.role,
+				name: element.accessibleName,
+				text: element.text,
+				valueState: element.valueState,
+				href: element.attributes.href,
+				selected: element.state?.selected,
+				expanded: element.state?.expanded,
+			})),
+		})
+	)
+}
+
+function verifyEvidenceItem(
+	item: EvidenceItem,
+	workItemId: string,
+	observation: PageObservation
+): EvidenceItem | undefined {
+	const quote = normalizeEvidenceText(item.source.quote)
+	if (!quote) return undefined
+	const block = (observation.content ?? []).find((candidate) =>
+		normalizeEvidenceText(candidate.text).includes(quote)
+	)
+	if (!block) return undefined
+	const capturedAt = observation.capturedAt
+	return {
+		...item,
+		evidenceId: `evidence:${stableHash(
+			`${workItemId}\n${observation.page.url}\n${item.entityName}\n${quote}`
+		)}`,
+		workItemId,
+		source: {
+			url: observation.page.url,
+			title: observation.page.title,
+			origin: observation.page.origin,
+			quote: item.source.quote.trim(),
+			contentBlockId: block.blockId,
+			capturedAt,
+		},
+		verification: 'verified',
+	}
+}
+
+function dedupeEvidence(items: EvidenceItem[]): EvidenceItem[] {
+	return [...new Map(items.map((item) => [item.evidenceId, item] as const)).values()].slice(-1_000)
+}
+
+function normalizeEvidenceText(value: string): string {
+	return value.normalize('NFKC').replace(/\s+/g, ' ').trim()
+}
+
+function stableHash(value: string): string {
+	let hash = 2166136261
+	for (let index = 0; index < value.length; index += 1) {
+		hash ^= value.charCodeAt(index)
+		hash = Math.imul(hash, 16777619)
+	}
+	return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 function snapshot(session: Session): SessionSnapshot {
 	return {
 		sessionId: session.sessionId,
@@ -840,6 +1243,10 @@ function snapshot(session: Session): SessionSnapshot {
 		currentGoalId: session.currentGoalId,
 		pendingConfirmationId: session.pendingConfirmation?.confirmationId,
 		finalResponse: session.finalResponse,
+		data:
+			session.plan || session.evidence
+				? { plan: session.plan, evidence: session.evidence ?? [] }
+				: undefined,
 	}
 }
 

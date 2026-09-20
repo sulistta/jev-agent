@@ -1,5 +1,6 @@
 import type {
 	Capability,
+	JsonValue,
 	PublicApiRequest,
 	PublicApiResponse,
 	PublicSessionEvent,
@@ -40,7 +41,7 @@ export interface PublicSessionGateway {
 		origin: string
 		sessionId: string
 		sessionToken: string
-	}): Promise<{ status: string; summary?: string }>
+	}): Promise<{ status: string; summary?: string; data?: JsonValue }>
 }
 
 const systemClock = { now: () => new Date().toISOString() }

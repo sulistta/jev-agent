@@ -106,7 +106,204 @@ function dependencies(verifier: RuntimeDependencies['verifier']): RuntimeDepende
 }
 
 describe('AgentRuntime', () => {
-	it('observes and synchronizes the opened tab instead of the original page', async () => {
+	it('plans browser work and completes research only from source-backed coverage', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.browser.observe = vi.fn(async () => ({
+			...observation(1),
+			content: [
+				{
+					blockId: 'content:hotel',
+					text: 'Hotel Aurora — rating 9.2 — Baixa',
+					contentHash: 'hotel-hash',
+				},
+			],
+		}))
+		deps.semanticText = {
+			plan: vi.fn(async () => ({
+				version: 1 as const,
+				canonicalGoal: 'Find one hotel',
+				originalLanguage: 'en',
+				missingInputs: [],
+				workItems: [
+					{
+						workItemId: 'hotels',
+						description: 'Find a well-rated hotel',
+						kind: 'research' as const,
+						required: true,
+						dependsOn: [],
+						status: 'pending' as const,
+					},
+				],
+				coverage: [
+					{
+						requirementId: 'hotel-count',
+						workItemId: 'hotels',
+						description: 'One distinct hotel',
+						minimum: 1,
+						distinctBy: 'entityName',
+					},
+				],
+				deliverable: 'A sourced hotel result',
+				externalActions: [],
+			})),
+			extract: vi.fn(async () => [
+				{
+					evidenceId: 'model-controlled-id',
+					workItemId: 'wrong-id',
+					entityType: 'hotel',
+					entityName: 'Hotel Aurora',
+					attributes: { rating: 9.2, neighborhood: 'Baixa' },
+					tags: ['hotel'],
+					source: {
+						url: 'https://untrusted.example/',
+						title: 'Untrusted',
+						origin: 'https://untrusted.example',
+						quote: 'Hotel Aurora — rating 9.2',
+						capturedAt: 'wrong',
+					},
+					verification: 'pending' as const,
+				},
+			]),
+			generate: vi.fn(async () => ({ text: 'Found Hotel Aurora with a verified source.' })),
+		}
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Find one hotel',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+
+		await expect(handle.result).resolves.toMatchObject({
+			status: 'completed',
+			finalResponse: 'Found Hotel Aurora with a verified source.',
+		})
+		expect(Reflect.get(deps.decisions, 'decide')).not.toHaveBeenCalled()
+		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledWith(
+			expect.objectContaining({ scope: 'document', includeNonInteractive: true }),
+			expect.any(AbortSignal)
+		)
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			plan: { workItems: [{ workItemId: 'hotels', status: 'satisfied' }] },
+			evidence: [
+				expect.objectContaining({
+					workItemId: 'hotels',
+					verification: 'verified',
+					source: expect.objectContaining({
+						url: 'https://example.test/',
+						contentBlockId: 'content:hotel',
+					}),
+				}),
+			],
+		})
+	})
+
+	it('replans after one consolidated missing-input question in the same session', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		let planCalls = 0
+		deps.semanticText = {
+			plan: vi.fn(async () => {
+				planCalls += 1
+				return {
+					version: 1 as const,
+					canonicalGoal: 'Open a destination',
+					originalLanguage: 'pt-BR',
+					missingInputs:
+						planCalls === 1
+							? [
+									{ key: 'destination', question: 'Qual destino devo abrir?' },
+									{ key: 'date', question: 'Para qual data?' },
+								]
+							: [],
+					workItems: [
+						{
+							workItemId: 'open',
+							description: 'Open the requested destination',
+							kind: 'interact' as const,
+							required: true,
+							dependsOn: [],
+							status: 'pending' as const,
+						},
+					],
+					coverage: [],
+					deliverable: 'Opened destination',
+					externalActions: [],
+				}
+			}),
+			generate: vi.fn(async () => ({ text: 'Concluído.' })),
+		}
+		deps.decisions.decide = vi.fn(async () => ({ kind: 'goal_satisfied' as const }))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'abra a viagem',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		await expect(runtime.getSession(handle.id)).resolves.toMatchObject({
+			status: 'waiting_user',
+		})
+		await runtime.reply(handle.id, 'Lisboa, 10 de outubro')
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(planCalls).toBe(2)
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			conversation: expect.arrayContaining([
+				expect.objectContaining({
+					role: 'assistant',
+					text: 'Qual destino devo abrir?\nPara qual data?',
+				}),
+				expect.objectContaining({ role: 'user', text: 'Lisboa, 10 de outubro' }),
+			]),
+		})
+	})
+
+	it('continues without asking when missing preferences are not blocking', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.taskRouter = {
+			route: vi.fn(async () => 'browser' as const),
+			shouldClarify: vi.fn(async () => false),
+		}
+		deps.semanticText = {
+			plan: vi.fn(async () => ({
+				version: 1 as const,
+				canonicalGoal: 'Research Lisbon',
+				originalLanguage: 'pt-BR',
+				missingInputs: [{ key: 'preference', question: 'Qual sua preferência?' }],
+				workItems: [
+					{
+						workItemId: 'browse',
+						description: 'Browse available options',
+						kind: 'interact' as const,
+						required: true,
+						dependsOn: [],
+						status: 'pending' as const,
+					},
+				],
+				coverage: [],
+				deliverable: 'Options',
+				externalActions: [],
+			})),
+			generate: vi.fn(async () => ({ text: 'Concluído.' })),
+		}
+		deps.decisions.decide = vi.fn(async () => ({ kind: 'goal_satisfied' as const }))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'pesquise opções para Lisboa',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.taskRouter, 'shouldClarify')).toHaveBeenCalledOnce()
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			plan: { missingInputs: [] },
+			conversation: expect.arrayContaining([expect.objectContaining({ role: 'user' })]),
+		})
+	})
+
+	it('waits for an opened tab to settle before observing it', async () => {
 		let checks = 0
 		const deps = dependencies({
 			verify: async () => ({ status: ++checks === 1 ? 'inconclusive' : 'satisfied', evidence: [] }),
@@ -142,7 +339,7 @@ describe('AgentRuntime', () => {
 		})
 		await handle.result
 		expect(Reflect.get(deps.browser, 'waitFor')).toHaveBeenCalledWith(
-			expect.objectContaining({ tabId: 'new-tab' }),
+			expect.objectContaining({ tabId: 'new-tab', expected: [] }),
 			expect.any(AbortSignal)
 		)
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenLastCalledWith(
@@ -150,6 +347,96 @@ describe('AgentRuntime', () => {
 			expect.any(AbortSignal)
 		)
 	})
+
+	it('accepts a confirmed scroll receipt without waiting for an unrelated DOM mutation', async () => {
+		let checks = 0
+		const deps = dependencies({
+			verify: async () => ({ status: ++checks === 1 ? 'inconclusive' : 'satisfied', evidence: [] }),
+		})
+		deps.decisions.decide = async () => ({
+			kind: 'action',
+			action: { type: 'scroll', axis: 'y', amount: { kind: 'pages', value: 1 } },
+		})
+		deps.browser.execute = async (request) => ({
+			actionId: request.actionId,
+			sessionId: request.sessionId,
+			startedAt: '2026-09-19T10:00:00.000Z',
+			endedAt: '2026-09-19T10:00:00.001Z',
+			status: 'executed',
+			result: {
+				ok: true,
+				effect: { type: 'viewport.scrolled', axis: 'y', amount: { kind: 'pages', value: 1 } },
+				signals: [],
+			},
+			observedSignals: [],
+		})
+		deps.browser.waitFor = vi.fn(deps.browser.waitFor.bind(deps.browser))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'scroll down',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'goal',
+					description: 'scroll down',
+					required: true,
+					status: 'pending',
+					evidenceIds: [],
+					outcome: { kind: 'predicate', predicate: { kind: 'text.contains', text: 'done' } },
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.browser, 'waitFor')).not.toHaveBeenCalled()
+	})
+
+	it('publishes action completion before waiting for page stabilization', async () => {
+		let checks = 0
+		const deps = dependencies({
+			verify: async () => ({ status: ++checks === 1 ? 'inconclusive' : 'satisfied', evidence: [] }),
+		})
+		const emittedTypes: string[] = []
+		deps.events = {
+			append: async (event) => {
+				emittedTypes.push(event.type)
+				return { ...event, sequence: emittedTypes.length }
+			},
+		}
+		let finishStabilization!: (result: SynchronizationResult) => void
+		deps.browser.waitFor = vi.fn(
+			() =>
+				new Promise<SynchronizationResult>((resolve) => {
+					finishStabilization = resolve
+				})
+		)
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Click save',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'goal',
+					description: 'Click save',
+					required: true,
+					status: 'pending',
+					evidenceIds: [],
+					outcome: { kind: 'predicate', predicate: { kind: 'text.contains', text: 'done' } },
+				},
+			],
+		})
+		await vi.waitFor(() => expect(emittedTypes).toContain('action.completed'))
+		expect(emittedTypes).not.toContain('synchronization.completed')
+		finishStabilization({
+			status: 'stabilized',
+			signals: [],
+			endedAt: '2026-09-19T10:00:00.002Z',
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(emittedTypes.indexOf('action.completed')).toBeLessThan(
+			emittedTypes.indexOf('synchronization.completed')
+		)
+	})
+
 	it('runs observe, decide, authorize, execute, and verify as one session flow', async () => {
 		let verificationCount = 0
 		const deps = dependencies({
@@ -193,6 +480,10 @@ describe('AgentRuntime', () => {
 			currentGoalId: 'goal-1',
 		})
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(2)
+		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledWith(
+			expect.objectContaining({ scope: 'viewport', includeNonInteractive: false }),
+			expect.any(AbortSignal)
+		)
 		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledTimes(1)
 		await expect(runtime.getSession(handle.id)).resolves.toMatchObject({ status: 'completed' })
 	})

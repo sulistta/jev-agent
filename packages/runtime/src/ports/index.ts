@@ -5,10 +5,12 @@ import type {
 	ConversationMessage,
 	DecisionNeed,
 	Evidence,
+	EvidenceItem,
 	GoalContract,
 	Session,
 	TaskContract,
 	TaskMode,
+	TaskPlan,
 } from '../domain'
 import type { RuntimeError } from '../errors/RuntimeError'
 import type { ConfirmationTokenManager } from '../security/ConfirmationTokens'
@@ -57,6 +59,7 @@ export interface DecisionResult {
 	evidence?: Evidence[]
 	reason?: string
 	error?: RuntimeError
+	fingerprint?: string
 }
 
 export interface DecisionRouter {
@@ -77,6 +80,7 @@ export interface TaskRouter {
 		input: { session: Session; request: string; conversation: ConversationMessage[] },
 		signal: AbortSignal
 	): Promise<TaskMode>
+	shouldClarify?(input: { session: Session; plan: TaskPlan }, signal: AbortSignal): Promise<boolean>
 }
 
 export type SemanticPurpose = 'response' | 'clarification' | 'summary' | 'input' | 'url'
@@ -86,6 +90,19 @@ export type SemanticPurpose = 'response' | 'clarification' | 'summary' | 'input'
  * element authority; callers validate its result before execution.
  */
 export interface SemanticTextProvider {
+	plan?(
+		input: { request: string; conversation: ConversationMessage[] },
+		signal: AbortSignal
+	): Promise<TaskPlan>
+	extract?(
+		input: {
+			request: string
+			plan: TaskPlan
+			workItemId: string
+			page: { url: string; title: string; content: string }
+		},
+		signal: AbortSignal
+	): Promise<EvidenceItem[]>
 	generate(
 		input: {
 			purpose: SemanticPurpose
@@ -95,6 +112,8 @@ export interface SemanticTextProvider {
 			page?: { url: string; title: string }
 			reason?: string
 			actionHistory?: { action: string; label: string }[]
+			plan?: TaskPlan
+			evidence?: EvidenceItem[]
 		},
 		signal: AbortSignal
 	): Promise<{ text?: string; url?: string }>
@@ -137,13 +156,13 @@ export interface RuntimeDependencies {
 
 export function createDefaultBudgets(): import('../domain').ExecutionBudgets {
 	return {
-		maxSteps: 50,
-		maxElapsedMs: 120_000,
-		maxActions: 50,
+		maxSteps: 0,
+		maxElapsedMs: 0,
+		maxActions: 0,
 		maxConsecutiveNoProgress: 3,
 		maxProviderCalls: {},
 		maxRetriesPerErrorCode: {},
-		maxTabs: 1,
+		maxTabs: 5,
 	}
 }
 

@@ -55,6 +55,12 @@ describe('LocalBrowserRuntime', () => {
 
 		expect(observation.sessionId).toBe(sessionId)
 		expect(observation.revision).toBe(1)
+		expect(observation.viewport).toEqual(
+			expect.objectContaining({
+				documentWidth: expect.any(Number),
+				documentHeight: expect.any(Number),
+			})
+		)
 		expect(observation.sanitization.secretFieldsRemoved).toBeGreaterThanOrEqual(1)
 		expect(password).toMatchObject({ sensitivity: 'secret' })
 		expect(password?.value).toBeUndefined()
@@ -86,6 +92,32 @@ describe('LocalBrowserRuntime', () => {
 			visible: true,
 			supportedActions: ['input', 'focus', 'click'],
 		})
+	})
+
+	it('observes non-interactive content only when requested and honors region scope', async () => {
+		document
+			.querySelector('main')!
+			.insertAdjacentHTML(
+				'beforeend',
+				'<p>Flight €120 · duration 2h 45m</p><div role="dialog"><p>Hotel Alfama</p></div>'
+			)
+		mockElementLayout()
+
+		const documentObservation = await runtime.observe(request(), new AbortController().signal)
+		const modalObservation = await runtime.observe(
+			{ ...request(), scope: 'region', regionIds: ['region:modal'] },
+			new AbortController().signal
+		)
+		const controlsOnly = await runtime.observe(
+			{ ...request(), includeNonInteractive: false },
+			new AbortController().signal
+		)
+
+		expect(documentObservation.content?.map((block) => block.text)).toContain(
+			'Flight €120 · duration 2h 45m'
+		)
+		expect(modalObservation.content?.map((block) => block.text)).toEqual(['Hotel Alfama'])
+		expect(controlsOnly.content).toEqual([])
 	})
 
 	it('exposes navigation destinations without leaking query strings or fragments', async () => {
@@ -248,6 +280,20 @@ describe('LocalBrowserRuntime', () => {
 		)
 		controller.abort()
 		await expect(cancelled).resolves.toMatchObject({ status: 'cancelled' })
+	})
+
+	it('does not report stability before an expected change occurs', async () => {
+		const waiting = runtime.waitFor(
+			{
+				sessionId,
+				tabId: 'in-page',
+				since: new Date().toISOString(),
+				expected: [{ type: 'dom' }],
+				settle: { quietWindowMs: 5, maxWaitMs: 25 },
+			},
+			new AbortController().signal
+		)
+		await expect(waiting).resolves.toMatchObject({ status: 'timeout' })
 	})
 
 	it('waits for a quiet window and restarts it when the page changes again', async () => {

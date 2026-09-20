@@ -8,3 +8,5 @@ export const DEFAULT_LLM_CONFIG: LLMConfig = {
 	baseURL: DEFAULT_LLM_BASE_URL,
 	model: DEFAULT_LLM_MODEL,
 }
+
+export const ACTIVE_UI_SESSION_KEY = 'PageAgentV2ActiveUiSession'

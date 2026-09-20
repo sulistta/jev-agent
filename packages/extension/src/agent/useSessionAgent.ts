@@ -8,13 +8,16 @@ import type {
 import type { Capability, PublicSessionEvent } from '@page-agent/protocol'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { getSession } from '@/lib/db'
+import { OpenAiCompatibleSemanticTextProvider } from '@/runtime/OpenAiCompatibleSemanticTextProvider'
+
 import {
 	activityForSessionEvent,
 	projectSessionEvent,
 	statusForSessionEvent,
 } from './SessionProjection'
-import type { AdvancedConfig, ExtConfig } from './config'
-import { DEFAULT_LLM_CONFIG } from './constants'
+import type { ExtConfig } from './config'
+import { ACTIVE_UI_SESSION_KEY, DEFAULT_LLM_CONFIG } from './constants'
 
 export interface UseSessionAgentResult {
 	waitingForUser: boolean
@@ -110,14 +113,32 @@ export function useSessionAgent(): UseSessionAgentResult {
 	}, [consumeEvent])
 
 	useEffect(() => {
-		chrome.storage.local.get(['llmConfig', 'language', 'advancedConfig']).then((result) => {
-			const llmConfig = (result.llmConfig as ExtConfig | undefined) ?? DEFAULT_LLM_CONFIG
-			const language = (result.language as SupportedLanguage) || undefined
-			const advancedConfig = (result.advancedConfig as AdvancedConfig) ?? {}
-			if (!result.llmConfig) void chrome.storage.local.set({ llmConfig: DEFAULT_LLM_CONFIG })
-			setConfig({ ...llmConfig, ...advancedConfig, language })
-		})
-	}, [])
+		chrome.storage.local
+			.get(['llmConfig', 'language', ACTIVE_UI_SESSION_KEY])
+			.then(async (result) => {
+				const llmConfig = (result.llmConfig as ExtConfig | undefined) ?? DEFAULT_LLM_CONFIG
+				const language = (result.language as SupportedLanguage) || undefined
+				if (!result.llmConfig) void chrome.storage.local.set({ llmConfig: DEFAULT_LLM_CONFIG })
+				setConfig({ ...llmConfig, language })
+				const activeSessionId = result[ACTIVE_UI_SESSION_KEY]
+				if (typeof activeSessionId !== 'string') return
+				const record = await getSession(activeSessionId)
+				if (!record || (record.status !== 'running' && record.status !== 'waiting_user')) {
+					await chrome.storage.local.remove(ACTIVE_UI_SESSION_KEY)
+					return
+				}
+				currentSessionRef.current = activeSessionId
+				historyRef.current = record.history
+				setHistory(record.history)
+				setCurrentTask(record.task)
+				setWaitingForUser(record.status === 'waiting_user')
+				statusRef.current = 'running'
+				setStatus('running')
+				const buffered = pendingEventsRef.current.get(activeSessionId) ?? []
+				pendingEventsRef.current.delete(activeSessionId)
+				for (const event of buffered) consumeEvent(event)
+			})
+	}, [consumeEvent])
 
 	const execute = useCallback(
 		async (task: string): Promise<ExecutionResult> => {
@@ -202,27 +223,19 @@ export function useSessionAgent(): UseSessionAgentResult {
 	}, [])
 
 	const configure = useCallback(async (next: ExtConfig) => {
-		const {
-			language,
-			maxSteps,
-			systemInstruction,
-			experimentalLlmsTxt,
-			experimentalIncludeAllTabs,
-			disableNamedToolChoice,
-			...llmConfig
-		} = next
+		const { language, ...llmConfig } = next
+		const probeController = new AbortController()
+		const probeTimeout = setTimeout(() => probeController.abort(), 15_000)
+		try {
+			await new OpenAiCompatibleSemanticTextProvider(llmConfig).probe(probeController.signal)
+		} finally {
+			clearTimeout(probeTimeout)
+		}
 		await chrome.storage.local.set({ llmConfig })
 		if (language) await chrome.storage.local.set({ language })
 		else await chrome.storage.local.remove('language')
-		const advancedConfig: AdvancedConfig = {
-			maxSteps,
-			systemInstruction,
-			experimentalLlmsTxt,
-			experimentalIncludeAllTabs,
-			disableNamedToolChoice,
-		}
-		await chrome.storage.local.set({ advancedConfig })
-		setConfig({ ...llmConfig, ...advancedConfig, language })
+		await chrome.storage.local.remove('advancedConfig')
+		setConfig({ ...llmConfig, language })
 	}, [])
 
 	return {

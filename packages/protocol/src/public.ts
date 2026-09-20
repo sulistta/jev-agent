@@ -38,6 +38,8 @@ export type PublicApiRequest = PublicSessionStartRequest | PublicSessionCommandR
 export interface PublicApiResponse {
 	requestId: string
 	ok: boolean
-	payload?: { sessionId: string; sessionToken: string } | { status: string; summary?: string }
+	payload?:
+		| { sessionId: string; sessionToken: string }
+		| { status: string; summary?: string; data?: JsonValue }
 	error?: { code: string; message: string; retryable: boolean }
 }

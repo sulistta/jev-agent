@@ -18,7 +18,6 @@ import type { ExtConfig, LanguagePreference } from '@/agent/config'
 import { DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL } from '@/agent/constants'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Switch } from '@/components/ui/switch'
 
 interface ConfigPanelProps {
 	config: ExtConfig | null
@@ -27,11 +26,9 @@ interface ConfigPanelProps {
 }
 
 interface JevConfig {
-	provider?: 'typesafe' | 'vercel'
 	endpoint: string
 	model: string
 	apiKey?: string
-	languagePolicy?: 'preserve' | 'english_questions' | 'normalized_bilingual'
 }
 
 const SITE_GRANT_CAPABILITIES: Capability[] = [
@@ -47,29 +44,16 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 	const [model, setModel] = useState(config?.model || DEFAULT_LLM_MODEL)
 	const [apiKey, setApiKey] = useState(config?.apiKey)
 	const [language, setLanguage] = useState<LanguagePreference>(config?.language)
-	const [maxSteps, setMaxSteps] = useState(config?.maxSteps)
-	const [systemInstruction, setSystemInstruction] = useState(config?.systemInstruction ?? '')
-	const [experimentalLlmsTxt, setExperimentalLlmsTxt] = useState(
-		config?.experimentalLlmsTxt ?? false
-	)
-	const [experimentalIncludeAllTabs, setExperimentalIncludeAllTabs] = useState(
-		config?.experimentalIncludeAllTabs ?? false
-	)
-	const [disableNamedToolChoice, setDisableNamedToolChoice] = useState(
-		config?.disableNamedToolChoice ?? false
-	)
 	const [advancedOpen, setAdvancedOpen] = useState(false)
 	const [saving, setSaving] = useState(false)
+	const [saveError, setSaveError] = useState<string | null>(null)
 	const [userAuthToken, setUserAuthToken] = useState('')
 	const [copied, setCopied] = useState(false)
 	const [showToken, setShowToken] = useState(false)
 	const [showApiKey, setShowApiKey] = useState(false)
-	const [jevProvider, setJevProvider] = useState<JevConfig['provider']>('typesafe')
 	const [jevEndpoint, setJevEndpoint] = useState('')
 	const [jevModel, setJevModel] = useState('')
 	const [jevApiKey, setJevApiKey] = useState('')
-	const [jevLanguagePolicy, setJevLanguagePolicy] =
-		useState<JevConfig['languagePolicy']>('preserve')
 	const [grantOrigin, setGrantOrigin] = useState<string | null>(null)
 	const [originGrant, setOriginGrant] = useState<{
 		grantId: string
@@ -86,11 +70,6 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 		setModel(config?.model || DEFAULT_LLM_MODEL)
 		setApiKey(config?.apiKey)
 		setLanguage(config?.language)
-		setMaxSteps(config?.maxSteps)
-		setSystemInstruction(config?.systemInstruction ?? '')
-		setExperimentalLlmsTxt(config?.experimentalLlmsTxt ?? false)
-		setExperimentalIncludeAllTabs(config?.experimentalIncludeAllTabs ?? false)
-		setDisableNamedToolChoice(config?.disableNamedToolChoice ?? false)
 	}
 
 	// Poll for user auth token every second until found
@@ -121,17 +100,9 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 		chrome.storage.local.get('jevConfig').then((result) => {
 			const stored = result.jevConfig as Partial<JevConfig> | undefined
 			if (!stored) return
-			if (stored.provider === 'typesafe' || stored.provider === 'vercel')
-				setJevProvider(stored.provider)
 			if (typeof stored.endpoint === 'string') setJevEndpoint(stored.endpoint)
 			if (typeof stored.model === 'string') setJevModel(stored.model)
 			if (typeof stored.apiKey === 'string') setJevApiKey(stored.apiKey)
-			if (
-				stored.languagePolicy === 'preserve' ||
-				stored.languagePolicy === 'english_questions' ||
-				stored.languagePolicy === 'normalized_bilingual'
-			)
-				setJevLanguagePolicy(stored.languagePolicy)
 		})
 	}, [])
 
@@ -197,31 +168,27 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 
 	const handleSave = async () => {
 		setSaving(true)
+		setSaveError(null)
 		try {
 			await onSave({
 				apiKey,
 				baseURL,
 				model,
 				language,
-				maxSteps: maxSteps || undefined,
-				systemInstruction: systemInstruction || undefined,
-				experimentalLlmsTxt,
-				experimentalIncludeAllTabs,
-				disableNamedToolChoice,
 			})
 			if (jevEndpoint.trim() && jevModel.trim()) {
 				await chrome.storage.local.set({
 					jevConfig: {
-						provider: jevProvider,
 						endpoint: jevEndpoint.trim(),
 						model: jevModel.trim(),
 						apiKey: jevApiKey.trim() || undefined,
-						languagePolicy: jevLanguagePolicy,
 					} satisfies JevConfig,
 				})
 			} else {
 				await chrome.storage.local.remove('jevConfig')
 			}
+		} catch (error) {
+			setSaveError(error instanceof Error ? error.message : String(error))
 		} finally {
 			setSaving(false)
 		}
@@ -408,74 +375,22 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 
 			{advancedOpen && (
 				<>
-					<div className="flex flex-col gap-1.5">
-						<label htmlFor="max-steps" className="text-xs text-muted-foreground">
-							Max Steps
-						</label>
-						<Input
-							id="max-steps"
-							type="number"
-							placeholder="40"
-							min={1}
-							max={200}
-							value={maxSteps ?? ''}
-							onChange={(e) => setMaxSteps(e.target.value ? Number(e.target.value) : undefined)}
-							className="text-xs h-8 [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none [-moz-appearance:textfield]"
-						/>
-					</div>
-
-					<div className="flex flex-col gap-1.5">
-						<label className="text-xs text-muted-foreground">System Instruction</label>
-						<textarea
-							placeholder="Additional instructions for the agent..."
-							value={systemInstruction}
-							onChange={(e) => setSystemInstruction(e.target.value)}
-							rows={3}
-							className="text-xs rounded-md border border-input bg-background px-3 py-2 resize-y min-h-[60px]"
-						/>
-					</div>
-
 					<div className="flex flex-col gap-1.5 p-3 bg-muted/50 rounded-md border">
 						<div>
 							<div className="text-xs font-medium text-muted-foreground">Jev provider</div>
 							<p className="text-[10px] text-muted-foreground mt-1">
-								Optional. TypeSafe accepts `/v1/` and appends `/systemone`; Vercel uses its
-								evaluation API.
+								TypeSafe System One endpoint. A `/v1/` URL is normalized to `/v1/systemone`.
 							</p>
 						</div>
-						<select
-							value={jevProvider}
-							onChange={(e) => {
-								const provider = e.target.value as JevConfig['provider']
-								setJevProvider(provider)
-								setJevApiKey('')
-								if (provider === 'vercel') {
-									setJevEndpoint('https://ai-gateway.vercel.sh')
-									setJevModel('typesafe-ai/jev')
-								} else {
-									setJevEndpoint('https://api.typesafe.ai/v1/')
-									setJevModel('jev-latest')
-								}
-							}}
-							className="h-8 text-xs rounded-md border border-input bg-background px-2 cursor-pointer"
-							aria-label="Jev provider type"
-						>
-							<option value="typesafe">TypeSafe AI API</option>
-							<option value="vercel">Vercel AI Gateway</option>
-						</select>
 						<Input
-							placeholder={
-								jevProvider === 'vercel'
-									? 'https://ai-gateway.vercel.sh'
-									: 'https://api.typesafe.ai/v1/'
-							}
+							placeholder="https://api.typesafe.ai/v1/"
 							value={jevEndpoint}
 							onChange={(e) => setJevEndpoint(e.target.value)}
 							className="text-xs h-8"
 							aria-label="Jev endpoint"
 						/>
 						<Input
-							placeholder={jevProvider === 'vercel' ? 'typesafe-ai/jev' : 'jev-latest'}
+							placeholder="jev-latest"
 							value={jevModel}
 							onChange={(e) => setJevModel(e.target.value)}
 							className="text-xs h-8"
@@ -483,50 +398,13 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 						/>
 						<Input
 							type="password"
-							placeholder={
-								jevProvider === 'vercel'
-									? 'Vercel AI Gateway API key (required)'
-									: 'TypeSafe API key (required)'
-							}
+							placeholder="TypeSafe API key (required)"
 							value={jevApiKey}
 							onChange={(e) => setJevApiKey(e.target.value)}
 							className="text-xs h-8"
 							aria-label="Jev API key"
 						/>
-						{jevProvider === 'vercel' && (
-							<p className="text-[10px] text-muted-foreground">
-								Use a key from Vercel Dashboard → AI Gateway → API Keys, including for free models.
-							</p>
-						)}
-						<select
-							value={jevLanguagePolicy}
-							onChange={(e) => setJevLanguagePolicy(e.target.value as JevConfig['languagePolicy'])}
-							className="h-8 text-xs rounded-md border border-input bg-background px-2 cursor-pointer"
-							aria-label="Jev language policy"
-						>
-							<option value="preserve">Preserve task language</option>
-							<option value="english_questions">English questions</option>
-							<option value="normalized_bilingual">Normalized bilingual</option>
-						</select>
 					</div>
-
-					<label className="flex items-center justify-between cursor-pointer">
-						<span className="text-xs text-muted-foreground">Disable named tool_choice</span>
-						<Switch checked={disableNamedToolChoice} onCheckedChange={setDisableNamedToolChoice} />
-					</label>
-
-					<label className="flex items-center justify-between cursor-pointer">
-						<span className="text-xs text-muted-foreground">Experimental llms.txt support</span>
-						<Switch checked={experimentalLlmsTxt} onCheckedChange={setExperimentalLlmsTxt} />
-					</label>
-
-					<label className="flex items-center justify-between cursor-pointer">
-						<span className="text-xs text-muted-foreground">Experimental include all tabs</span>
-						<Switch
-							checked={experimentalIncludeAllTabs}
-							onCheckedChange={setExperimentalIncludeAllTabs}
-						/>
-					</label>
 				</>
 			)}
 
@@ -542,6 +420,11 @@ export function ConfigPanel({ config, onSave, onClose }: ConfigPanelProps) {
 					{saving ? <Loader2 className="size-3 animate-spin" /> : 'Save'}
 				</Button>
 			</div>
+			{saveError && (
+				<p role="alert" className="text-xs text-destructive">
+					{saveError}
+				</p>
+			)}
 
 			{/* Footer */}
 			<div className="mt-4 mb-4 pt-4 border-t border-border/50 flex gap-2 justify-between text-[10px] text-muted-foreground">

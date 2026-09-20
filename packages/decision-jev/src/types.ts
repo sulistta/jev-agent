@@ -72,8 +72,11 @@ export interface JevDecisionContext {
 	risk: RiskTier
 	action?: ActionName
 	state: JsonValue
-	options: JevOption[]
+	primitive?: JevPrimitive
+	options?: JevOption[]
 	questionId?: string
+	prompt?: string
+	allowNone?: boolean
 }
 
 export interface JevDecisionResult {

@@ -10,7 +10,8 @@ import {
 	validateInputText,
 } from './JevDecisionRouter'
 import { SeedThresholdPolicy } from './gates'
-import { MockJevTransport, jsonStateBytes } from './transports'
+import { MockJevTransport } from './transports'
+import type { JevRequest } from './types'
 
 const observation: PageObservation = {
 	observationId: 'observation-1',
@@ -20,30 +21,16 @@ const observation: PageObservation = {
 	revision: 1,
 	capturedAt: '2026-09-19T10:00:00.000Z',
 	page: { url: 'https://example.test', title: 'Example', origin: 'https://example.test' },
-	viewport: { width: 100, height: 100, scrollX: 0, scrollY: 0 },
+	viewport: {
+		width: 1280,
+		height: 720,
+		scrollX: 0,
+		scrollY: 0,
+		documentWidth: 1280,
+		documentHeight: 720,
+	},
 	regions: [],
-	elements: [
-		{
-			ref: {
-				kind: 'element',
-				sessionId: 'session-1',
-				tabId: 'tab-1',
-				documentId: 'document-1',
-				observationId: 'observation-1',
-				revision: 1,
-				localId: 'index:0',
-				fingerprint: 'fnv1a:test',
-			},
-			tagName: 'button',
-			accessibleName: 'Save',
-			text: 'Save',
-			visible: true,
-			enabled: true,
-			editable: false,
-			attributes: {},
-			sensitivity: 'public',
-		},
-	],
+	elements: [element(0, 'Save')],
 	signals: [],
 	sanitization: { policyId: 'default', redactedFields: 0, secretFieldsRemoved: 0 },
 }
@@ -85,8 +72,61 @@ const session = {
 	updatedAt: '2026-09-19T10:00:00.000Z',
 } satisfies Session
 
+function element(index: number, label: string): PageObservation['elements'][number] {
+	return {
+		ref: {
+			kind: 'element',
+			sessionId: 'session-1',
+			tabId: 'tab-1',
+			documentId: 'document-1',
+			observationId: 'observation-1',
+			revision: 1,
+			localId: `index:${index}`,
+			fingerprint: `fnv1a:${index}`,
+		},
+		tagName: 'button',
+		accessibleName: label,
+		text: label,
+		visible: true,
+		enabled: true,
+		editable: false,
+		attributes: {},
+		sensitivity: 'public',
+		supportedActions: ['click'],
+		bounds: { x: 10, y: index * 10, width: 100, height: 20 },
+	}
+}
+
+function provider(transport: MockJevTransport): JevDecisionProvider {
+	return new JevDecisionProvider({
+		model: 'jev-test',
+		transport,
+		thresholds: new SeedThresholdPolicy(),
+		telemetry: 'off',
+	})
+}
+
+function choiceResponse(request: JevRequest, candidateId: string, confidence = 0.99) {
+	return {
+		requestId: request.requestId,
+		answers: request.questions.map((question) => ({
+			questionId: question.questionId,
+			selectedOptionId: candidateId,
+			confidence,
+		})),
+	}
+}
+
+const need = {
+	kind: 'select_candidate' as const,
+	closedWorld: true,
+	computable: false,
+	risk: 'R1' as const,
+	requiredCapabilities: ['dom.write'],
+}
+
 describe('JevDecisionRouter', () => {
-	it('rejects unsafe model URLs before tab.open can execute', () => {
+	it('rejects unsafe semantic values before execution', () => {
 		expect(validateHttpUrl('https://example.test/path')).toBe('https://example.test/path')
 		for (const value of [
 			'javascript:alert(1)',
@@ -97,386 +137,107 @@ describe('JevDecisionRouter', () => {
 			expect(() => validateHttpUrl(value)).toThrow()
 		expect(() => validateInputText('   ')).toThrow()
 	})
-	it('offers tab.open without a readable DOM and delegates its URL to the semantic model', async () => {
-		const task = 'open an arbitrary destination'
-		const selection = 'tab.open'
+
+	it('uses one direct Choice containing every concrete action up to 255', async () => {
+		const elements = Array.from({ length: 255 }, (_, index) => element(index, `Control ${index}`))
+		const selectedId = 'observation-1:jev:click:index:254'
 		const transport = new MockJevTransport((request) => {
-			expect(request.questions[0].options?.some((option) => option.id === selection)).toBe(true)
+			expect(request.questions).toHaveLength(1)
+			expect(request.questions[0]).toMatchObject({ primitive: 'choice', allowNone: false })
+			expect(request.questions[0].options).toHaveLength(255)
+			expect(request.questions[0].options?.at(-1)?.id).toBe(selectedId)
+			return choiceResponse(request, selectedId)
+		})
+		const result = await new JevDecisionRouter(provider(transport)).decide(
+			{ session, goal, observation: { ...observation, elements }, need },
+			new AbortController().signal
+		)
+		expect(result).toMatchObject({
+			kind: 'action',
+			candidateId: selectedId,
+			action: { type: 'click', target: { localId: 'index:254' } },
+		})
+		expect(transport.requests).toHaveLength(1)
+	})
+
+	it('uses parallel Noul judgments in one request above 255 actions', async () => {
+		const elements = Array.from({ length: 274 }, (_, index) =>
+			element(index, index === 273 ? 'Gostei' : `Control ${index}`)
+		)
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions).toHaveLength(274)
+			expect(request.questions.every((question) => question.primitive === 'noul')).toBe(true)
+			expect(request.questions[273].state).toMatchObject({
+				originalRequest: 'save the form',
+				currentGoal: 'Like the second oldest video',
+				candidates: expect.arrayContaining([
+					expect.objectContaining({ index: 273, label: 'click Gostei' }),
+				]),
+			})
 			return {
 				requestId: request.requestId,
-				answers: [
-					{ questionId: 'candidate.select', selectedOptionId: selection, confidence: 0.99 },
-				],
+				answers: request.questions.map((question, index) => ({
+					questionId: question.questionId,
+					value: index === 273 ? 0.98 : 0.1,
+					confidence: 0.9,
+				})),
 			}
 		})
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport,
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24000,
-			telemetry: 'off',
-		})
-		const result = await new JevDecisionRouter(provider, {
-			generate: async () => ({ url: 'https://example.test/path' }),
-		}).decide(
+		const result = await new JevDecisionRouter(provider(transport)).decide(
 			{
-				session: {
-					...session,
-					task: { ...session.task, allowedCapabilities: ['dom.read', 'dom.write', 'tabs.write'] },
-				},
-				goal: { ...goal, description: task },
-				observation: {
-					...observation,
-					elements: [],
-					page: { url: 'chrome://newtab/', title: 'New tab', origin: 'null' },
-				},
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
+				session,
+				goal: { ...goal, description: 'Like the second oldest video' },
+				observation: { ...observation, elements },
+				need,
 			},
 			new AbortController().signal
 		)
 		expect(result).toMatchObject({
 			kind: 'action',
-			action: { type: 'tab.open', url: 'https://example.test/path' },
+			action: { type: 'click', target: { localId: 'index:273' } },
 		})
+		expect(transport.requests).toHaveLength(1)
 	})
 
-	it('routes a greeting as conversation before any DOM observation', async () => {
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport: new MockJevTransport((request) => ({
-				requestId: request.requestId,
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'task:conversation',
-						confidence: 0.99,
-					},
-				],
-			})),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24_000,
-			telemetry: 'off',
+	it('does not merge controls with identical labels at different positions', async () => {
+		const selectedId = 'observation-1:jev:click:index:1'
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions[0].options).toEqual([
+				expect.objectContaining({ id: 'observation-1:jev:click:index:0' }),
+				expect.objectContaining({ id: selectedId }),
+			])
+			return choiceResponse(request, selectedId)
 		})
 		await expect(
-			new JevTaskRouter(provider).route({ session, request: 'oi' }, new AbortController().signal)
-		).resolves.toBe('conversation')
-	})
-
-	it('compacts large observations before calling Jev', async () => {
-		const transport = new MockJevTransport((request) => {
-			const question = request.questions[0]
-			expect(jsonStateBytes(question.state)).toBeLessThanOrEqual(16_000)
-			expect(question.options?.length).toBeLessThanOrEqual(34)
-			expect(
-				new TextEncoder().encode(JSON.stringify(question.options ?? [])).byteLength
-			).toBeLessThanOrEqual(12_000)
-			return {
-				requestId: request.requestId,
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'none_of_the_above',
-						confidence: 0.99,
+			new JevDecisionRouter(provider(transport)).decide(
+				{
+					session,
+					goal,
+					observation: {
+						...observation,
+						elements: [element(0, 'Like'), element(1, 'Like')],
 					},
-				],
-			}
-		})
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport,
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24_000,
-			telemetry: 'off',
-		})
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal: { ...goal, description: 'encontre um vídeo específico' },
-				observation: {
-					...observation,
-					elements: Array.from({ length: 306 }, (_, index) => ({
-						...observation.elements[0],
-						ref: { ...observation.elements[0].ref, localId: `index:${index}` },
-						accessibleName: `Ação da página com conteúdo repetido ${index} ${'x'.repeat(160)}`,
-						text: `Ação da página com conteúdo repetido ${index} ${'y'.repeat(160)}`,
-					})),
+					need,
 				},
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
-			},
-			new AbortController().signal
-		)
-		expect(result).toMatchObject({ kind: 'replan' })
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({ action: { target: { localId: 'index:1' } } })
 	})
 
-	it('keeps the stable destination instead of an equivalent ephemeral suggestion', async () => {
-		const stableCandidateId = 'observation-1:jev:click:index:117'
-		const transport = new MockJevTransport((request) => {
-			const options = request.questions[0].options ?? []
-			expect(options.some((option) => option.id === stableCandidateId)).toBe(true)
-			expect(options.some((option) => option.id === 'observation-1:jev:click:index:21')).toBe(false)
-			return {
-				requestId: request.requestId,
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: stableCandidateId,
-						confidence: 0.99,
-					},
-				],
-			}
-		})
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport,
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24_000,
-			telemetry: 'off',
-		})
-		const elements: PageObservation['elements'] = [
-			{
-				...observation.elements[0],
-				ref: { ...observation.elements[0].ref, localId: 'index:21' },
-				tagName: 'button',
-				accessibleName: 'lucas montano',
-				text: 'lucas montano',
-			},
-			{
-				...observation.elements[0],
-				ref: { ...observation.elements[0].ref, localId: 'index:117' },
-				tagName: 'a',
-				accessibleName: 'Lucas Montano',
-				text: 'Lucas Montano',
-				attributes: { href: 'https://www.youtube.com/@LucasMontano' },
-			},
-		]
-
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal: {
-					...goal,
-					description: 'vai no youtube e coloca o primeiro video que o lucas montano postou',
-				},
-				observation: {
-					...observation,
-					page: {
-						url: 'https://www.youtube.com/',
-						title: 'YouTube',
-						origin: 'https://www.youtube.com',
-					},
-					elements,
-				},
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({
-			kind: 'action',
-			candidateId: stableCandidateId,
-			action: { type: 'click', target: { localId: 'index:117' } },
-		})
-	})
-
-	it('offers ARIA comboboxes as click actions with structural context', async () => {
-		const candidateId = 'observation-1:jev:click:index:174'
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport: new MockJevTransport((request) => {
-				expect(request.questions[0].options).toContainEqual(
-					expect.objectContaining({ id: candidateId, label: expect.stringContaining('y=240') })
-				)
-				return {
-					requestId: request.requestId,
-					answers: [
-						{ questionId: 'candidate.select', selectedOptionId: candidateId, confidence: 0.99 },
-					],
-				}
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24_000,
-			telemetry: 'off',
-		})
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal: { ...goal, description: 'coloque o primeiro vídeo publicado' },
-				observation: {
-					...observation,
-					elements: [
-						{
-							...observation.elements[0],
-							ref: { ...observation.elements[0].ref, localId: 'index:174' },
-							tagName: 'div',
-							role: 'combobox',
-							accessibleName: 'Mais recentes',
-							text: 'Mais recentes',
-							regionId: 'region:results',
-							bounds: { x: 20, y: 240, width: 120, height: 32 },
-						},
-					],
-				},
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({ kind: 'action', action: { type: 'click' } })
-	})
-
-	it('limits a decision to an open menu instead of competing with the page behind it', async () => {
-		const oldestId = 'observation-1:jev:click:index:202'
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport: new MockJevTransport((request) => {
-				const options = request.questions[0].options ?? []
-				expect(options).toContainEqual(expect.objectContaining({ id: oldestId }))
-				expect(options.some((option) => option.id.endsWith('index:1'))).toBe(false)
-				return {
-					requestId: request.requestId,
-					answers: [
-						{
-							questionId: 'candidate.select',
-							selectedOptionId: oldestId,
-							confidence: 0.99,
-						},
-					],
-				}
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24_000,
-			telemetry: 'off',
-		})
-		const elements: PageObservation['elements'] = [
-			{
-				...observation.elements[0],
-				ref: { ...observation.elements[0].ref, localId: 'index:1' },
-				accessibleName: 'Lucas Montano',
-				text: 'Lucas Montano',
-				regionId: 'region:results',
-			},
-			...['Mais recentes', 'Em alta', 'Mais antigos'].map((label, index) => ({
-				...observation.elements[0],
-				ref: { ...observation.elements[0].ref, localId: `index:${200 + index}` },
-				role: 'menuitem',
-				accessibleName: label,
-				text: label,
-				regionId: 'region:modal',
-			})),
-		]
-
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal: { ...goal, description: 'coloque o primeiro vídeo publicado pelo canal' },
-				observation: { ...observation, elements },
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({
-			kind: 'action',
-			candidateId: oldestId,
-			action: { type: 'click', target: { localId: 'index:202' } },
-		})
-	})
-
-	it('selects the input with Jev and obtains multilingual free text from the semantic model', async () => {
-		let calls = 0
-		const transport = new MockJevTransport((request) => {
-			calls++
-			if (calls === 1)
-				expect(request.questions[0].state).toMatchObject({
-					page: {
-						elements: [
-							expect.objectContaining({
-								id: 'observation-1:jev:input:index:0',
-								valueState: 'empty',
-							}),
-						],
-					},
-				})
-			const selectedOptionId = 'observation-1:jev:input:index:0'
-			expect(selectedOptionId).toBeDefined()
-			return {
-				requestId: request.requestId,
-				answers: [{ questionId: 'candidate.select', selectedOptionId, confidence: 0.99 }],
-			}
-		})
-		const provider = new JevDecisionProvider({
-			model: 'test',
-			transport,
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 24000,
-			telemetry: 'off',
-		})
-		const result = await new JevDecisionRouter(provider, {
-			generate: async (input) => {
-				expect(input.purpose).toBe('input')
-				return { text: 'ルーカス・モンターノ' }
-			},
+	it('uses supportedActions as the structural source of truth', async () => {
+		const input = {
+			...element(0, 'Search'),
+			tagName: 'div',
+			editable: false,
+			supportedActions: ['input' as const],
+			valueState: 'empty' as const,
+		}
+		const selectedId = 'observation-1:jev:input:index:0'
+		const transport = new MockJevTransport((request) => choiceResponse(request, selectedId))
+		const result = await new JevDecisionRouter(provider(transport), {
+			generate: async () => ({ text: 'ルーカス・モンターノ' }),
 		}).decide(
-			{
-				session,
-				goal: { ...goal, description: 'pesquise Lucas Montano no youtube' },
-				observation: {
-					...observation,
-					elements: [
-						{
-							...observation.elements[0],
-							tagName: 'input',
-							accessibleName: 'Search',
-							editable: true,
-							valueState: 'empty',
-						},
-					],
-				},
-				need: {
-					kind: 'select_operation',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: [],
-				},
-			},
+			{ session, goal, observation: { ...observation, elements: [input] }, need },
 			new AbortController().signal
 		)
 		expect(result.action).toMatchObject({
@@ -484,268 +245,327 @@ describe('JevDecisionRouter', () => {
 			text: 'ルーカス・モンターノ',
 			replace: true,
 		})
-		expect(calls).toBe(1)
-	})
-	it('turns a high-confidence opaque candidate selection into a browser action', async () => {
-		const provider = new JevDecisionProvider({
-			model: 'jev-test',
-			transport: new MockJevTransport({
-				requestId: 'unused',
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'observation-1:jev:click:index:0',
-						confidence: 0.95,
-					},
-				],
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 20_000,
-			telemetry: 'off',
-		})
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal,
-				observation,
-				need: {
-					kind: 'select_candidate',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: ['dom.write'],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({ kind: 'action', candidateId: 'observation-1:jev:click:index:0' })
-		expect(result.action).toMatchObject({ type: 'click', target: { localId: 'index:0' } })
 	})
 
-	it('executes an explicit reversible candidate even when the choice distribution is diffuse', async () => {
-		const candidateId = 'observation-1:jev:click:index:0'
-		const provider = new JevDecisionProvider({
-			model: 'jev-test',
-			transport: new MockJevTransport({
-				requestId: 'unused',
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: candidateId,
-						confidence: 0.05,
-					},
-				],
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 20_000,
-			telemetry: 'off',
-		})
-
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal,
-				observation,
-				need: {
-					kind: 'select_candidate',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: ['dom.write'],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({ kind: 'action', candidateId })
-	})
-
-	it('does not treat a low-confidence completion judgment as a reversible browser action', async () => {
-		const provider = new JevDecisionProvider({
-			model: 'jev-test',
-			transport: new MockJevTransport({
-				requestId: 'unused',
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'goal:satisfied',
-						confidence: 0.05,
-					},
-				],
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 20_000,
-			telemetry: 'off',
-		})
-
-		const result = await new JevDecisionRouter(provider).decide(
-			{
-				session,
-				goal,
-				observation,
-				need: {
-					kind: 'select_candidate',
-					closedWorld: true,
-					computable: false,
-					risk: 'R1',
-					requiredCapabilities: ['dom.write'],
-				},
-			},
-			new AbortController().signal
-		)
-
-		expect(result).toMatchObject({ kind: 'replan', reason: 'Confidence below human threshold' })
-	})
-
-	it('lets Jev finish a browser goal only through the explicit satisfied option', async () => {
-		const provider = new JevDecisionProvider({
-			model: 'jev-test',
-			transport: new MockJevTransport({
-				requestId: 'unused',
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'goal:satisfied',
-						confidence: 0.95,
-					},
-				],
-			}),
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 20_000,
-			telemetry: 'off',
-		})
-
-		await expect(
-			new JevDecisionRouter(provider).decide(
-				{
-					session,
-					goal,
-					observation,
-					need: {
-						kind: 'select_operation',
-						closedWorld: true,
-						computable: false,
-						risk: 'R1',
-						requiredCapabilities: [],
-					},
-				},
-				new AbortController().signal
-			)
-		).resolves.toMatchObject({ kind: 'goal_satisfied' })
-	})
-
-	it('verifies a completed page transition before selecting another action', async () => {
-		let calls = 0
-		const candidateId = 'observation-1:jev:click:index:0'
+	it('represents every native select option as a complete action', async () => {
+		const select = {
+			...element(0, 'Sort'),
+			tagName: 'select',
+			supportedActions: ['select' as const],
+			options: [
+				{ label: 'Newest', value: 'new', selected: true },
+				{ label: 'Oldest', value: 'old', selected: false },
+			],
+		}
+		const selectedId = 'observation-1:jev:select:index:0:option:1'
 		const transport = new MockJevTransport((request) => {
-			calls += 1
-			if (calls === 1) {
-				return {
-					requestId: request.requestId,
-					answers: [
-						{
-							questionId: 'candidate.select',
-							selectedOptionId: candidateId,
-							confidence: 0.99,
-						},
-					],
-				}
-			}
-
 			expect(request.questions[0].options).toEqual([
-				expect.objectContaining({ id: 'goal:continue' }),
-				expect.objectContaining({ id: 'goal:satisfied' }),
+				expect.objectContaining({ id: selectedId, label: expect.stringContaining('Oldest') }),
 			])
-			expect(request.questions[0].state).toMatchObject({
-				currentPage: {
-					url: 'https://www.youtube.com/watch?v=first',
-					title: 'Primeiro vídeo do canal',
+			return choiceResponse(request, selectedId)
+		})
+		const result = await new JevDecisionRouter(provider(transport)).decide(
+			{ session, goal, observation: { ...observation, elements: [select] }, need },
+			new AbortController().signal
+		)
+		expect(result.action).toMatchObject({
+			type: 'select',
+			option: { kind: 'value', value: 'old' },
+		})
+		expect(transport.requests).toHaveLength(1)
+	})
+
+	it('offers scroll candidates for unobserved viewport areas', async () => {
+		const selectedId = 'observation-1:jev:scroll:down'
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions[0].options).toContainEqual(
+				expect.objectContaining({ id: selectedId })
+			)
+			return choiceResponse(request, selectedId)
+		})
+		const result = await new JevDecisionRouter(provider(transport)).decide(
+			{
+				session,
+				goal,
+				observation: {
+					...observation,
+					viewport: { ...observation.viewport, documentHeight: 2200 },
 				},
-				recentSelections: [
+				need,
+			},
+			new AbortController().signal
+		)
+		expect(result.action).toEqual({
+			type: 'scroll',
+			axis: 'y',
+			amount: { kind: 'pages', value: 1 },
+		})
+	})
+
+	it('restricts a blocking modal to its own controls', async () => {
+		const modal = { ...element(1, 'Oldest'), regionId: 'dialog:sort' }
+		const selectedId = 'observation-1:jev:click:index:1'
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions[0].options).toEqual([expect.objectContaining({ id: selectedId })])
+			return choiceResponse(request, selectedId)
+		})
+		await new JevDecisionRouter(provider(transport)).decide(
+			{
+				session,
+				goal,
+				observation: {
+					...observation,
+					regions: [{ regionId: 'dialog:sort', kind: 'modal', elementIds: [modal.ref.localId] }],
+					elements: [element(0, 'Behind dialog'), modal],
+					viewport: { ...observation.viewport, documentHeight: 2200 },
+				},
+				need,
+			},
+			new AbortController().signal
+		)
+	})
+
+	it('opens arbitrary destinations without a DOM and delegates only the URL text', async () => {
+		const candidateId = 'observation-1:jev:tab.open'
+		const tabsSession = {
+			...session,
+			task: { ...session.task, allowedCapabilities: ['dom.read', 'dom.write', 'tabs.write'] },
+		} satisfies Session
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions[0]).toMatchObject({
+				primitive: 'choice',
+				allowNone: false,
+				options: [
 					expect.objectContaining({
-						action: 'click',
-						label: 'Primeiro vídeo do canal',
+						id: candidateId,
+						label: expect.stringContaining('semantic model derives the destination URL'),
 					}),
 				],
 			})
-			return {
-				requestId: request.requestId,
-				answers: [
-					{
-						questionId: 'candidate.select',
-						selectedOptionId: 'goal:satisfied',
-						confidence: 0.99,
-					},
-				],
-			}
+			return choiceResponse(request, candidateId)
 		})
-		const provider = new JevDecisionProvider({
-			model: 'jev-test',
-			transport,
-			thresholds: new SeedThresholdPolicy(),
-			languagePolicy: 'preserve',
-			maxStateBytes: 20_000,
-			telemetry: 'off',
-		})
-		const router = new JevDecisionRouter(provider)
-		const videoGoal = {
-			...goal,
-			description: 'coloque o primeiro vídeo publicado pelo canal',
-		}
-		const sourceObservation = {
-			...observation,
-			page: {
-				url: 'https://www.youtube.com/@canal/videos?sort=oldest',
-				title: 'Canal - vídeos mais antigos',
-				origin: 'https://www.youtube.com',
-			},
-			elements: [
-				{
-					...observation.elements[0],
-					accessibleName: 'Primeiro vídeo do canal',
-					text: 'Primeiro vídeo do canal',
+		const result = await new JevDecisionRouter(provider(transport), {
+			generate: async () => ({ url: 'https://unregistered.example/path' }),
+		}).decide(
+			{
+				session: { ...tabsSession, browserScope: { ...tabsSession.browserScope } },
+				goal,
+				observation: {
+					...observation,
+					tabId: 'unbound',
+					documentId: 'unbound',
+					elements: [],
 				},
-			],
-		}
-		const need = {
-			kind: 'select_operation' as const,
-			closedWorld: true,
-			computable: false,
-			risk: 'R1' as const,
-			requiredCapabilities: [],
-		}
+				need,
+			},
+			new AbortController().signal
+		)
+		expect(result.action).toEqual({ type: 'tab.open', url: 'https://unregistered.example/path' })
+	})
 
+	it('does not add an abstract none option to concrete Choice actions', async () => {
+		const selectedId = 'observation-1:jev:click:index:0'
+		const transport = new MockJevTransport((request) => {
+			expect(request.questions[0]).toMatchObject({ allowNone: false })
+			expect(request.questions[0].options).toEqual([expect.objectContaining({ id: selectedId })])
+			return choiceResponse(request, selectedId)
+		})
 		await expect(
-			router.decide(
-				{ session, goal: videoGoal, observation: sourceObservation, need },
+			new JevDecisionRouter(provider(transport)).decide(
+				{ session, goal, observation, need },
 				new AbortController().signal
 			)
-		).resolves.toMatchObject({ kind: 'action', candidateId })
+		).resolves.toMatchObject({ kind: 'action', candidateId: selectedId })
+		expect(transport.requests).toHaveLength(1)
+	})
 
+	it('preserves the concrete Choice winner when relative confidence is low', async () => {
+		const selectedId = 'observation-1:jev:click:index:0'
+		const transport = new MockJevTransport((request) => choiceResponse(request, selectedId, 0.05))
+		await expect(
+			new JevDecisionRouter(provider(transport)).decide(
+				{ session, goal, observation, need },
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({
+			kind: 'action',
+			candidateId: selectedId,
+			action: { type: 'click', target: { localId: 'index:0' } },
+		})
+	})
+
+	it('blocks after every Noul candidate is evaluated as unsuitable', async () => {
+		const elements = Array.from({ length: 256 }, (_, index) => element(index, `Control ${index}`))
+		const transport = new MockJevTransport((request) => ({
+			requestId: request.requestId,
+			answers: request.questions.map((question) => ({
+				questionId: question.questionId,
+				value: 0.1,
+				confidence: 0.9,
+			})),
+		}))
+		await expect(
+			new JevDecisionRouter(provider(transport)).decide(
+				{ session, goal, observation: { ...observation, elements }, need },
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({
+			kind: 'blocked',
+			reason: expect.stringContaining('all 256 candidates'),
+		})
+		expect(transport.requests).toHaveLength(1)
+	})
+
+	it('does not repeat an already attempted action on an unchanged page', async () => {
+		const selectedId = 'observation-1:jev:click:index:0'
+		const transport = new MockJevTransport((request) => choiceResponse(request, selectedId))
+		const router = new JevDecisionRouter(provider(transport))
+		const first = await router.decide(
+			{ session, goal, observation, need },
+			new AbortController().signal
+		)
+		await expect(
+			router.decide(
+				{
+					session: { ...session, decisionFingerprints: [first.fingerprint!] },
+					goal,
+					observation,
+					need,
+				},
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({
+			kind: 'blocked',
+			reason: expect.stringContaining('already been attempted'),
+		})
+		expect(transport.requests).toHaveLength(1)
+	})
+
+	it('breaks an A-B-A cycle while allowing actions in a genuinely changed state', async () => {
+		let call = 0
+		const firstId = 'observation-1:jev:click:index:0'
+		const changedStateId = 'observation-2:jev:click:index:0'
+		const alternativeId = 'observation-3:jev:click:index:1'
+		const transport = new MockJevTransport((request) => {
+			call += 1
+			if (call === 1) return choiceResponse(request, firstId)
+			const selectedId = call === 2 ? changedStateId : alternativeId
+			const options = request.questions.find(
+				(question) => question.questionId === 'action'
+			)?.options
+			if (call === 2)
+				expect(options).toContainEqual(expect.objectContaining({ id: changedStateId }))
+			else expect(options).toEqual([expect.objectContaining({ id: alternativeId })])
+			return {
+				requestId: request.requestId,
+				answers: request.questions.map((question) =>
+					question.questionId === 'completion'
+						? { questionId: question.questionId, value: 0.1, confidence: 0.9 }
+						: {
+								questionId: question.questionId,
+								selectedOptionId: selectedId,
+								confidence: 0.9,
+							}
+				),
+			}
+		})
+		const router = new JevDecisionRouter(provider(transport))
+		const cycleElements = [element(0, 'Toggle menu'), element(1, 'Continue')]
+		await expect(
+			router.decide(
+				{ session, goal, observation: { ...observation, elements: cycleElements }, need },
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({ candidateId: firstId })
+		const changedObservation = {
+			...observation,
+			observationId: 'observation-2',
+			page: { ...observation.page, title: 'Menu open' },
+			elements: cycleElements,
+		}
 		await expect(
 			router.decide(
 				{
 					session,
-					goal: videoGoal,
+					goal,
+					observation: changedObservation,
+					need,
+				},
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({ kind: 'action', candidateId: changedStateId })
+		await expect(
+			router.decide(
+				{
+					session,
+					goal,
+					observation: {
+						...observation,
+						observationId: 'observation-3',
+						elements: cycleElements,
+					},
+					need,
+				},
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({ kind: 'action', candidateId: alternativeId })
+		expect(transport.requests).toHaveLength(3)
+	})
+
+	it('offers completion in the same decision request after the page changes', async () => {
+		let call = 0
+		const transport = new MockJevTransport((request) => {
+			call += 1
+			const selectedId = 'observation-1:jev:click:index:0'
+			if (call === 2) {
+				expect(request.questions).toHaveLength(2)
+				expect(request.questions[1]).toMatchObject({
+					questionId: 'completion',
+					primitive: 'noul',
+				})
+				return {
+					requestId: request.requestId,
+					answers: [
+						{ questionId: 'action', selectedOptionId: selectedId, confidence: 0.9 },
+						{ questionId: 'completion', value: 0.95, confidence: 0.95 },
+					],
+				}
+			}
+			return choiceResponse(request, selectedId)
+		})
+		const router = new JevDecisionRouter(provider(transport))
+		await expect(
+			router.decide({ session, goal, observation, need }, new AbortController().signal)
+		).resolves.toMatchObject({ kind: 'action' })
+		await expect(
+			router.decide(
+				{
+					session,
+					goal,
 					observation: {
 						...observation,
 						observationId: 'observation-2',
-						page: {
-							url: 'https://www.youtube.com/watch?v=first',
-							title: 'Primeiro vídeo do canal',
-							origin: 'https://www.youtube.com',
-						},
+						page: { ...observation.page, title: 'Saved' },
 					},
 					need,
 				},
 				new AbortController().signal
 			)
 		).resolves.toMatchObject({ kind: 'goal_satisfied' })
-		expect(calls).toBe(2)
+		expect(transport.requests).toHaveLength(2)
+	})
+})
+
+describe('JevTaskRouter', () => {
+	it('routes a greeting as conversation before any DOM observation', async () => {
+		const transport = new MockJevTransport((request) =>
+			choiceResponse(request, 'task:conversation')
+		)
+		await expect(
+			new JevTaskRouter(provider(transport)).route(
+				{ session, request: 'oi' },
+				new AbortController().signal
+			)
+		).resolves.toBe('conversation')
 	})
 })

@@ -1,4 +1,4 @@
-import type { PublicSessionEvent, PublicSessionStartPayload } from '@page-agent/protocol'
+import type { JsonValue, PublicSessionEvent, PublicSessionStartPayload } from '@page-agent/protocol'
 
 export interface RunnerStartInput extends PublicSessionStartPayload {
 	origin: string
@@ -81,13 +81,14 @@ export async function ensureRunnerTab(): Promise<void> {
 	const existing = await chrome.tabs.query({ url: `${runnerUrl}*` })
 	const existingTab = existing.find((tab) => tab.id !== undefined)
 	if (existingTab?.id !== undefined) {
-		// A runner page can survive a service-worker restart while its Port does
-		// not. Reload the orphaned page so it creates a fresh connection.
-		if (!runnerPort) await chrome.tabs.reload(existingTab.id)
+		// The runner owns live in-memory executions and reconnects its Port after a
+		// service-worker restart. Give that reconnect a chance before reloading the
+		// page, because a reload would destroy every active execution.
+		if (!runnerPort && !(await waitForRunnerPort(1_500))) await chrome.tabs.reload(existingTab.id)
 	} else {
 		await chrome.tabs.create({ url: runnerUrl, active: false, pinned: true })
 	}
-	await waitForRunnerPort()
+	if (!(await waitForRunnerPort())) throw new Error('RUNNER_UNAVAILABLE')
 }
 
 export function waitForRunnerPort(timeoutMs = 5_000): Promise<boolean> {
@@ -137,7 +138,10 @@ export function runnerGateway() {
 		reply: (input: { origin: string; sessionId: string; sessionToken: string; text: string }) =>
 			requestRunner<unknown>({ type: 'session.reply', input }).then(() => undefined),
 		result: (input: { origin: string; sessionId: string; sessionToken: string }) =>
-			requestRunner<{ status: string; summary?: string }>({ type: 'session.result', input }),
+			requestRunner<{ status: string; summary?: string; data?: JsonValue }>({
+				type: 'session.result',
+				input,
+			}),
 	}
 }
 

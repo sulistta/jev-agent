@@ -69,6 +69,75 @@ function isVisible(element: HTMLElement): boolean {
 	return bounds.width > 0 && bounds.height > 0 && element.getClientRects().length > 0
 }
 
+function elementMatchesObservationScope(
+	element: HTMLElement,
+	localId: string,
+	request: ObservationRequest
+): boolean {
+	if (request.scope === 'document') return true
+	if (request.scope === 'targets')
+		return (request.targetRefs ?? []).some((target) => target.localId === localId)
+	if (request.scope === 'region')
+		return (request.regionIds ?? []).includes(`region:${regionKind(element)}`)
+	const bounds = element.getBoundingClientRect()
+	return (
+		bounds.bottom >= 0 &&
+		bounds.right >= 0 &&
+		bounds.top <= window.innerHeight &&
+		bounds.left <= window.innerWidth
+	)
+}
+
+function collectContentBlocks(
+	request: ObservationRequest
+): NonNullable<PageObservation['content']> {
+	if (request.scope === 'targets') return []
+	const seen = new Set<string>()
+	const blocks: NonNullable<PageObservation['content']> = []
+	const elements = document.querySelectorAll<HTMLElement>(
+		'h1, h2, h3, h4, h5, h6, p, li, dt, dd, td, th, figcaption, blockquote'
+	)
+	for (const element of elements) {
+		if (blocks.length >= 200 || !isVisible(element) || sensitivity(element) === 'secret') continue
+		if (!elementMatchesContentScope(element, request)) continue
+		const text = element.innerText.replace(/\s+/g, ' ').trim().slice(0, 1_000)
+		if (text.length < 2 || seen.has(text)) continue
+		seen.add(text)
+		const bounds = element.getBoundingClientRect()
+		blocks.push({
+			blockId: `content:${blocks.length}:${shortHash(text)}`,
+			text,
+			regionId: `region:${regionKind(element)}`,
+			tagName: element.tagName.toLowerCase(),
+			bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
+			contentHash: shortHash(text),
+		})
+	}
+	return blocks
+}
+
+function elementMatchesContentScope(element: HTMLElement, request: ObservationRequest): boolean {
+	if (request.scope === 'document') return true
+	if (request.scope === 'region')
+		return (request.regionIds ?? []).includes(`region:${regionKind(element)}`)
+	const bounds = element.getBoundingClientRect()
+	return (
+		bounds.bottom >= 0 &&
+		bounds.right >= 0 &&
+		bounds.top <= window.innerHeight &&
+		bounds.left <= window.innerWidth
+	)
+}
+
+function shortHash(value: string): string {
+	let hash = 2166136261
+	for (let index = 0; index < value.length; index += 1) {
+		hash ^= value.charCodeAt(index)
+		hash = Math.imul(hash, 16777619)
+	}
+	return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
 function isEnabled(element: HTMLElement): boolean {
 	return (
 		!(
@@ -288,6 +357,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 
 		for (const [index, element] of candidates) {
 			const localId = `index:${index}`
+			if (!elementMatchesObservationScope(element, localId, request)) continue
 			const ref: ElementRef = {
 				kind: 'element',
 				sessionId: request.sessionId,
@@ -370,6 +440,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 						: undefined,
 			})
 		}
+		const content = request.includeNonInteractive ? collectContentBlocks(request) : []
 
 		return {
 			observationId,
@@ -384,6 +455,14 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				height: window.innerHeight,
 				scrollX: window.scrollX,
 				scrollY: window.scrollY,
+				documentWidth: Math.max(
+					document.documentElement.scrollWidth,
+					document.body?.scrollWidth ?? 0
+				),
+				documentHeight: Math.max(
+					document.documentElement.scrollHeight,
+					document.body?.scrollHeight ?? 0
+				),
 			},
 			regions: Array.from(regionElements, ([regionId, region]) => ({
 				regionId,
@@ -391,6 +470,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				elementIds: region.elementIds,
 			})),
 			elements,
+			content,
 			signals: [],
 			sanitization: {
 				policyId: request.sensitivityPolicyId,
@@ -403,6 +483,18 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 	async execute(request: BrowserActionRequest, signal: AbortSignal): Promise<ActionReceipt> {
 		this.assertAvailable(signal)
 		const startedAt = now()
+		const urlBeforeAction = window.location.href
+		const mutations: MutationRecord[] = []
+		const actionObserver =
+			typeof MutationObserver === 'undefined'
+				? undefined
+				: new MutationObserver((records) => mutations.push(...records))
+		actionObserver?.observe(document, {
+			subtree: true,
+			childList: true,
+			attributes: true,
+			characterData: true,
+		})
 		try {
 			const result = await this.executeAction(
 				request.action,
@@ -410,9 +502,14 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				request.expectedSessionRevision,
 				signal
 			)
+			await Promise.resolve()
+			mutations.push(...(actionObserver?.takeRecords() ?? []))
 			this.revision += 1
-			const signals = [signalEvent('dom.mutated', { relevant: true })]
-			if (request.action.type === 'input') {
+			const signals: BrowserSignal[] = []
+			if (mutations.length > 0) signals.push(signalEvent('dom.mutated', { relevant: true }))
+			if (window.location.href !== urlBeforeAction)
+				signals.push(signalEvent('route.changed', { url: window.location.href }))
+			if (request.action.type === 'input' || request.action.type === 'select') {
 				signals.push(signalEvent('target.valueChanged', { localId: request.action.target.localId }))
 			}
 			this.lastSignals = signals
@@ -441,6 +538,8 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				error: runtimeError,
 				observedSignals: [],
 			}
+		} finally {
+			actionObserver?.disconnect()
 		}
 	}
 
@@ -523,7 +622,12 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				resolve(result)
 			}
 			const armQuietWindow = () => {
-				if (finished || document.readyState === 'loading') return
+				if (
+					finished ||
+					document.readyState === 'loading' ||
+					(!expectedObserved && request.expected.length > 0)
+				)
+					return
 				if (quietTimer) clearTimeout(quietTimer)
 				quietTimer = setTimeout(
 					() =>
@@ -745,7 +849,11 @@ function signalMatches(expected: ExpectedChange, signal: BrowserSignal): boolean
 				(expected.targetLocalId === undefined || signal.localId === expected.targetLocalId)
 			)
 		case 'navigation':
-			return signal.type === 'navigation.started' || signal.type === 'navigation.completed'
+			return (
+				signal.type === 'navigation.started' ||
+				signal.type === 'navigation.completed' ||
+				signal.type === 'route.changed'
+			)
 		case 'document':
 			return signal.type === 'document.changed'
 		case 'target.appeared':

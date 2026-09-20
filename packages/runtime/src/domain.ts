@@ -40,6 +40,7 @@ export type OutcomePredicate =
 	| { kind: 'element.present'; ref?: ElementRef; label?: string }
 	| { kind: 'element.value'; ref: ElementRef; value: string }
 	| { kind: 'tab.exists'; tabId: string }
+	| { kind: 'runtime.managed' }
 
 export interface TaskContract {
 	taskId: string
@@ -103,10 +104,90 @@ export interface Session {
 	conversation?: ConversationMessage[]
 	/** The user-facing terminal response produced by the semantic provider. */
 	finalResponse?: string
+	/** Structured plan for browser work. Rebuilt after each clarification reply. */
+	plan?: TaskPlan
+	/** Verified, source-backed facts collected across pages and tabs. */
+	evidence?: EvidenceItem[]
+	/** Current runtime phase, persisted so diagnostics describe actual workflow state. */
+	phase?: ExecutionPhase
+	/** Fingerprints already judged by Jev; identical judgments are never repeated. */
+	decisionFingerprints?: string[]
+	/** Receipts and verified outcomes, rather than merely proposed selections. */
+	actionJournal?: ActionJournalEntry[]
+	/** Research observations already offered to extraction, including empty results. */
+	extractionFingerprints?: string[]
 	currentGoalId?: string
 	pendingConfirmation?: PendingConfirmation
 	createdAt: string
 	updatedAt: string
+}
+
+export type ExecutionPhase =
+	| 'planning'
+	| 'waiting_user'
+	| 'observing'
+	| 'deciding'
+	| 'executing'
+	| 'settling'
+	| 'verifying'
+	| 'extracting'
+	| 'synthesizing'
+
+export interface TaskPlan {
+	version: 1
+	canonicalGoal: string
+	originalLanguage: string
+	missingInputs: { key: string; question: string }[]
+	workItems: TaskWorkItem[]
+	coverage: CoverageRequirement[]
+	deliverable: string
+	externalActions: string[]
+}
+
+export interface TaskWorkItem {
+	workItemId: string
+	description: string
+	kind: 'navigate' | 'research' | 'interact'
+	required: boolean
+	dependsOn: string[]
+	status: GoalStatus
+}
+
+export interface CoverageRequirement {
+	requirementId: string
+	workItemId: string
+	description: string
+	minimum: number
+	distinctBy?: string
+	requiredTags?: string[]
+}
+
+export interface EvidenceItem {
+	evidenceId: string
+	workItemId: string
+	entityType: string
+	entityName: string
+	attributes: Record<string, JsonValue>
+	tags: string[]
+	source: {
+		url: string
+		title: string
+		origin: string
+		quote: string
+		contentBlockId?: string
+		capturedAt: string
+	}
+	verification: 'pending' | 'verified' | 'unsupported' | 'contradicted'
+}
+
+export interface ActionJournalEntry {
+	actionId: string
+	workItemId?: string
+	action: string
+	label: string
+	status: 'executed' | 'failed'
+	observationId: string
+	completedAt: string
 }
 
 export type TaskMode = 'conversation' | 'browser'

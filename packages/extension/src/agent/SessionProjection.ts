@@ -35,6 +35,8 @@ export function projectSessionEvent(
 					},
 				]
 			return history
+		case 'user.reply':
+			return [...history, { type: 'observation', content: 'Reply received. Continuing task.' }]
 		case 'observation.captured':
 			return [
 				...history,

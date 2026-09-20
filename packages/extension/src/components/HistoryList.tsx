@@ -131,6 +131,8 @@ export function HistoryList({
 						{/* Status icon */}
 						{session.status === 'completed' ? (
 							<CheckCircle className="size-3.5 text-green-500 shrink-0 mt-0.5" />
+						) : session.status === 'running' || session.status === 'waiting_user' ? (
+							<History className="size-3.5 text-blue-500 shrink-0 mt-0.5" />
 						) : (
 							<XCircle className="size-3.5 text-destructive shrink-0 mt-0.5" />
 						)}

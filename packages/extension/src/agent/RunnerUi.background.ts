@@ -1,8 +1,11 @@
 import type { Capability, PublicSessionEvent } from '@page-agent/protocol'
 
+import { getSession, upsertSession } from '@/lib/db'
 import { isTrustedExtensionPageSender } from '@/security/ExtensionSender'
 
 import { ensureRunnerTab, runnerGateway, subscribeRunnerEvents } from './RunnerPort.background'
+import { projectSessionEvent } from './SessionProjection'
+import { ACTIVE_UI_SESSION_KEY } from './constants'
 
 type UiMessage =
 	| {
@@ -29,19 +32,37 @@ interface UiFailure {
 const gateway = runnerGateway()
 const uiSessions = new Set<string>()
 const bufferedEvents = new Map<string, PublicSessionEvent[]>()
+const historyWrites = new Map<string, Promise<void>>()
 let pendingUiStarts = 0
 
 subscribeRunnerEvents(({ sessionId, event }) => {
+	void routeUiEvent(sessionId, event)
+})
+
+async function routeUiEvent(sessionId: string, event: PublicSessionEvent): Promise<void> {
+	if (!uiSessions.has(sessionId)) {
+		const existing = await getSession(sessionId)
+		if (existing?.status === 'running' || existing?.status === 'waiting_user')
+			uiSessions.add(sessionId)
+	}
 	if (uiSessions.has(sessionId)) {
+		queueHistoryWrite(sessionId, event)
 		broadcastEvent(event)
-	} else if (pendingUiStarts > 0) {
+		if (event.type === 'session.terminal') {
+			uiSessions.delete(sessionId)
+			const active = await chrome.storage.local.get(ACTIVE_UI_SESSION_KEY)
+			if (active[ACTIVE_UI_SESSION_KEY] === sessionId)
+				await chrome.storage.local.remove(ACTIVE_UI_SESSION_KEY)
+		}
+		return
+	}
+	if (pendingUiStarts > 0) {
 		const events = bufferedEvents.get(sessionId) ?? []
 		events.push(event)
 		if (events.length > 128) events.shift()
 		bufferedEvents.set(sessionId, events)
 	}
-	if (event.type === 'session.terminal') uiSessions.delete(sessionId)
-})
+}
 
 export async function handleRunnerUiMessage(
 	message: unknown,
@@ -53,8 +74,6 @@ export async function handleRunnerUiMessage(
 		return failure('PROTOCOL_MALFORMED', 'Malformed UI session message', false)
 
 	if (message.type === 'PAGE_AGENT_V2_UI_CANCEL') {
-		if (!uiSessions.has(message.sessionId))
-			return failure('SESSION_INVALID', 'Session is not owned by the side panel', false)
 		try {
 			await gateway.cancel({
 				origin: extensionOrigin(),
@@ -67,8 +86,6 @@ export async function handleRunnerUiMessage(
 		}
 	}
 	if (message.type === 'PAGE_AGENT_V2_UI_REPLY') {
-		if (!uiSessions.has(message.sessionId))
-			return failure('SESSION_INVALID', 'Session is not owned by the side panel', false)
 		try {
 			await gateway.reply({
 				origin: extensionOrigin(),
@@ -103,6 +120,14 @@ export async function handleRunnerUiMessage(
 			created = await gateway.start(input)
 		}
 		uiSessions.add(created.sessionId)
+		await upsertSession({
+			id: created.sessionId,
+			task: message.task,
+			history: [],
+			status: 'running',
+			createdAt: Date.now(),
+		})
+		await chrome.storage.local.set({ [ACTIVE_UI_SESSION_KEY]: created.sessionId })
 		flushEvents(created.sessionId)
 		return { ok: true, sessionId: created.sessionId }
 	} catch (error) {
@@ -147,8 +172,55 @@ function flushEvents(sessionId: string): void {
 	const events = bufferedEvents.get(sessionId)
 	if (!events) return
 	bufferedEvents.delete(sessionId)
-	for (const event of events) broadcastEvent(event)
-	if (events.some((event) => event.type === 'session.terminal')) uiSessions.delete(sessionId)
+	for (const event of events) {
+		queueHistoryWrite(sessionId, event)
+		broadcastEvent(event)
+	}
+	if (events.some((event) => event.type === 'session.terminal')) {
+		uiSessions.delete(sessionId)
+		void chrome.storage.local.remove(ACTIVE_UI_SESSION_KEY)
+	}
+}
+
+function queueHistoryWrite(sessionId: string, event: PublicSessionEvent): void {
+	const previous = historyWrites.get(sessionId) ?? Promise.resolve()
+	const next = previous
+		.then(async () => {
+			const record = await getSession(sessionId)
+			if (!record) return
+			await upsertSession({
+				...record,
+				history: projectSessionEvent(record.history, event),
+				status: historyStatus(record.status, event),
+			})
+		})
+		.catch((error: unknown) => {
+			console.error('[RunnerUI] Failed to persist session history:', error)
+		})
+		.finally(() => {
+			if (historyWrites.get(sessionId) === next) historyWrites.delete(sessionId)
+		})
+	historyWrites.set(sessionId, next)
+}
+
+function historyStatus(
+	current: import('@/lib/db').SessionRecord['status'],
+	event: PublicSessionEvent
+): import('@/lib/db').SessionRecord['status'] {
+	if (event.type === 'session.status_changed' && isRecord(event.payload)) {
+		if (event.payload.status === 'waiting_user' || event.payload.status === 'paused')
+			return 'waiting_user'
+		if (event.payload.status === 'running') return 'running'
+	}
+	if (event.type !== 'session.terminal' || !isRecord(event.payload)) return current
+	if (event.payload.status === 'completed' || event.payload.status === 'partially_completed')
+		return 'completed'
+	if (event.payload.status === 'cancelled') return 'stopped'
+	return 'error'
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function broadcastEvent(event: PublicSessionEvent): void {

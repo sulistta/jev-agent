@@ -123,6 +123,20 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 			false
 		)
 	}
+	if (request.type === 'dom.wait' && !endpoint) {
+		try {
+			// A tab-created receipt is available before the newly injected content
+			// script can observe page stability. Wait for its document handshake;
+			// the forwarded wait then applies the normal DOM quiet window.
+			await waitForDocumentEndpoint(tabId, request.maxWaitMs)
+		} catch {
+			return success({
+				status: 'timeout',
+				signals: [],
+				endedAt: new Date().toISOString(),
+			})
+		}
+	}
 
 	try {
 		return await forwardDomRequest(tabId, request)

@@ -14,6 +14,8 @@ export interface ViewportDescriptor {
 	height: number
 	scrollX: number
 	scrollY: number
+	documentWidth?: number
+	documentHeight?: number
 }
 
 export type PageRegionKind = 'viewport' | 'modal' | 'form' | 'results' | 'navigation' | 'content'
@@ -87,9 +89,19 @@ export interface PageObservation {
 	viewport: ViewportDescriptor
 	regions: PageRegion[]
 	elements: ObservedElement[]
+	content?: ObservedContentBlock[]
 	signals: BrowserSignal[]
 	sanitization: SanitizationSummary
 	metadata?: Record<string, JsonValue>
+}
+
+export interface ObservedContentBlock {
+	blockId: string
+	text: string
+	regionId?: string
+	tagName?: string
+	bounds?: { x: number; y: number; width: number; height: number }
+	contentHash: string
 }
 
 export interface ObservationRequest {
