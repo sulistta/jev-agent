@@ -6,13 +6,7 @@ import { AnimatedGradientText } from '../../components/ui/animated-gradient-text
 import { Highlighter } from '../../components/ui/highlighter'
 import { NeonGradientCard } from '../../components/ui/neon-gradient-card'
 import { Particles } from '../../components/ui/particles'
-import {
-	CDN_DEMO_CN_URL,
-	CDN_DEMO_URL,
-	// DEMO_API_KEY,
-	DEMO_BASE_URL,
-	DEMO_MODEL,
-} from '../../constants'
+import { CDN_DEMO_CN_URL, CDN_DEMO_URL, DEFAULT_BASE_URL, DEFAULT_MODEL } from '../../constants'
 import { useLanguage } from '../../i18n/context'
 
 let pageAgentModule: Promise<typeof import('page-agent')> | null = null
@@ -64,13 +58,14 @@ export default function HeroSection() {
 	const [cdnSource, setCdnSource] = useState<'international' | 'china'>('international')
 
 	const [ready, setReady] = useState(false)
+	const hasConfiguredProvider = Boolean(import.meta.env.LLM_API_KEY)
 	useEffect(() => {
 		pageAgentModule ??= import('page-agent')
 		pageAgentModule.then(() => setReady(true))
 	}, [])
 
 	const handleExecute = async () => {
-		if (!task.trim() || !ready || !pageAgentModule) return
+		if (!task.trim() || !ready || !pageAgentModule || !hasConfiguredProvider) return
 
 		const { PageAgent } = await pageAgentModule
 		const win = window as any
@@ -90,15 +85,15 @@ export default function HeroSection() {
 				model:
 					import.meta.env.DEV && import.meta.env.LLM_MODEL_NAME
 						? import.meta.env.LLM_MODEL_NAME
-						: DEMO_MODEL,
+						: DEFAULT_MODEL,
 				baseURL:
 					import.meta.env.DEV && import.meta.env.LLM_BASE_URL
 						? import.meta.env.LLM_BASE_URL
-						: DEMO_BASE_URL,
+						: DEFAULT_BASE_URL,
 				apiKey:
 					import.meta.env.DEV && import.meta.env.LLM_API_KEY
 						? import.meta.env.LLM_API_KEY
-						: undefined,
+						: import.meta.env.LLM_API_KEY,
 			})
 		}
 
@@ -217,11 +212,11 @@ export default function HeroSection() {
 												/>
 												<button
 													onClick={handleExecute}
-													disabled={!ready}
+													disabled={!ready || !hasConfiguredProvider}
 													className="absolute right-2 top-2 px-5 py-1.5 bg-linear-to-r from-blue-600 to-purple-600 text-white font-medium rounded-md hover:shadow-md transform hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none text-sm"
 													data-page-agent-not-interactive
 												>
-													{ready ? (
+													{ready && hasConfiguredProvider ? (
 														isZh ? (
 															'执行'
 														) : (
@@ -229,35 +224,18 @@ export default function HeroSection() {
 														)
 													) : (
 														<span className="animate-pulse">
-															{isZh ? '准备中...' : 'Preparing...'}
+															{isZh ? '配置 API Key' : 'Configure API key'}
 														</span>
 													)}
 												</button>
 											</div>
 											<p className="text-xs text-gray-500 dark:text-gray-400 text-left">
 												{isZh ? (
-													<>
-														使用免费测试 LLM API，点击执行即表示您同意
-														<a
-															href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-															target="_blank"
-															rel="noopener noreferrer"
-															className="underline"
-														>
-															使用条款
-														</a>
-													</>
+													<>网页演示仅在构建时配置 LLM_API_KEY 后启用。</>
 												) : (
 													<>
-														Powered by free testing LLM API. By clicking Run you agree to the{' '}
-														<a
-															href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-															target="_blank"
-															rel="noopener noreferrer"
-															className="underline"
-														>
-															Terms of Use
-														</a>
+														The website demo is enabled only when LLM_API_KEY is configured at build
+														time.
 													</>
 												)}
 											</p>
@@ -329,36 +307,16 @@ export default function HeroSection() {
 													<li className="flex items-start text-left">
 														<span className="w-1.5 h-1.5 bg-yellow-500 rounded-full mt-2 mr-2 shrink-0 "></span>
 														{isZh ? (
-															<span>
-																使用免费测试 LLM API，使用即表示同意
-																<a
-																	href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-																	target="_blank"
-																	rel="noopener noreferrer"
-																	className="text-yellow-700 dark:text-yellow-300 underline"
-																>
-																	使用条款
-																</a>
-															</span>
+															<span>需要在构建时配置自己的 LLM_API_KEY。</span>
 														) : (
-															<span>
-																Uses free testing LLM API. By using you agree to the{' '}
-																<a
-																	href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-																	target="_blank"
-																	rel="noopener noreferrer"
-																	className="text-yellow-700 dark:text-yellow-300 underline"
-																>
-																	Terms of Use
-																</a>
-															</span>
+															<span>Configure your own LLM_API_KEY at build time.</span>
 														)}
 													</li>
 													<li className="flex items-start text-left">
 														<span className="w-1.5 h-1.5 bg-yellow-500 rounded-full mt-2 mr-2 shrink-0 "></span>
 														{isZh
-															? '数据通过中国大陆服务器处理'
-															: 'Data processed via servers in Mainland China'}
+															? '数据发送到你配置的模型提供商。'
+															: 'Data is sent to your configured model provider.'}
 													</li>
 													<li className="flex items-start text-left">
 														<span className="w-1.5 h-1.5 bg-yellow-500 rounded-full mt-2 mr-2 shrink-0 "></span>

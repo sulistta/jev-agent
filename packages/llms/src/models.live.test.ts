@@ -23,7 +23,6 @@
  *
  *   TESTING_OPENROUTER_KEY=...
  *   TESTING_DEEPSEEK_KEY=...
- *   TESTING_ALIYUN_KEY=...
  */
 import { config as dotenvConfig } from 'dotenv'
 import { dirname, resolve } from 'path'
@@ -46,20 +45,6 @@ const TEST_TIMEOUT = 30_000
  * Keep both lists in sync manually when models are added or renamed.
  */
 const MODEL_GROUPS: Record<string, string[]> = {
-	Qwen: [
-		'qwen3.8-max',
-		'qwen3.8-flash',
-		'qwen3.8-27b',
-		'qwen3.7-flash',
-		'qwen3.7-max',
-		'qwen3.7-plus',
-		'qwen3.6-max',
-		'qwen3.6-plus',
-		'qwen3.6-flash',
-		'qwen3.5-plus',
-		'qwen3.5-flash',
-		'qwen3-max',
-	],
 	OpenAI: [
 		'gpt-6-astra',
 		'gpt-5.6-sol',
@@ -115,10 +100,9 @@ const MODEL_GROUPS: Record<string, string[]> = {
 /**
  * OpenRouter lists every model as `<vendor-slug>/<model-id>`, lowercase.
  * See the commented-out entries in the repo-root `.env` for real examples,
- * e.g. `x-ai/grok-4.1-fast`, `qwen/qwen3-coder-next`, `deepseek/deepseek-v3.2-exp`.
+ * e.g. `x-ai/grok-4.1-fast`, `deepseek/deepseek-v3.2-exp`.
  */
 const OPENROUTER_VENDOR_SLUG: Record<string, string> = {
-	Qwen: 'qwen',
 	OpenAI: 'openai',
 	DeepSeek: 'deepseek',
 	Google: 'google',
@@ -138,10 +122,6 @@ const OPENROUTER_VENDOR_SLUG: Record<string, string> = {
  * on 2026-09-06; re-check when models are added to `MODEL_GROUPS`.
  */
 const OPENROUTER_ID_OVERRIDES: Record<string, string> = {
-	'qwen3.8-max': 'qwen/qwen3.8-max-0902',
-	'qwen3.6-max': 'qwen/qwen3.6-max-preview',
-	'qwen3.5-plus': 'qwen/qwen3.5-plus-20260420',
-	'qwen3.5-flash': 'qwen/qwen3.5-flash-02-23',
 	'deepseek-v4-pro': 'deepseek/deepseek-v4-pro-0813',
 	'deepseek-v4-flash': 'deepseek/deepseek-v4-flash-0731',
 	'deepseek-3.2': 'deepseek/deepseek-v3.2',
@@ -170,10 +150,6 @@ const PROVIDERS = {
 	openrouter: {
 		baseURL: 'https://openrouter.ai/api/v1',
 		apiKey: process.env.TESTING_OPENROUTER_KEY,
-	},
-	aliyun: {
-		baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-		apiKey: process.env.TESTING_ALIYUN_KEY,
 	},
 	deepseek: {
 		baseURL: 'https://api.deepseek.com',
@@ -216,27 +192,6 @@ describe.concurrent('OpenRouter — all listed models', () => {
 				TEST_TIMEOUT
 			)
 		}
-	}
-})
-
-// Aliyun native ids that don't match the display name in MODEL_GROUPS.
-const ALIYUN_ID_OVERRIDES: Record<string, string> = {
-	'qwen3.8-max': 'qwen3.8-max-0902',
-	'qwen3.6-max': 'qwen3.6-max-preview',
-}
-
-describe.concurrent('Aliyun DashScope — Qwen native', () => {
-	const { baseURL, apiKey } = PROVIDERS.aliyun
-
-	for (const model of MODEL_GROUPS.Qwen) {
-		const id = ALIYUN_ID_OVERRIDES[model] ?? model
-		it.skipIf(!apiKey)(
-			id,
-			async () => {
-				await expectEchoToolCall(baseURL, apiKey!, id)
-			},
-			TEST_TIMEOUT
-		)
 	}
 })
 

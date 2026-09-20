@@ -11,26 +11,10 @@ const BASELINE = new Set([
 	'claude-haiku-4-5',
 	'gemini-3.8-flash',
 	'deepseek-v4-flash',
-	'qwen3.5-plus',
-	'qwen3.5-flash',
 ])
 
 // Models grouped by brand, newest first
 const MODEL_GROUPS: Record<string, string[]> = {
-	Qwen: [
-		'qwen3.8-max',
-		'qwen3.8-flash',
-		'qwen3.8-27b',
-		'qwen3.7-flash',
-		'qwen3.7-max',
-		'qwen3.7-plus',
-		'qwen3.6-max',
-		'qwen3.6-plus',
-		'qwen3.6-flash',
-		'qwen3.5-plus',
-		'qwen3.5-flash',
-		'qwen3-max',
-	], // 'qwen3-coder-next', // low success rate
 	OpenAI: [
 		'gpt-6-astra',
 		'gpt-5.6-sol',
@@ -158,62 +142,14 @@ export default function Models() {
 			<section className="mb-10">
 				<Heading id="configuration">{isZh ? '配置方式' : 'Configuration'}</Heading>
 				<CodeEditor
-					code={`// OpenAI-compatible services (e.g., Alibaba Bailian)
+					code={`// OpenAI-compatible service
 const pageAgent = new PageAgent({
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  baseURL: 'https://openrouter.ai/api/v1',
   apiKey: 'your-api-key',
-  model: 'qwen3.5-plus'
+  model: 'openrouter/free'
 });
 `}
 				/>
-			</section>
-
-			<section className="mb-10">
-				<Heading id="free-testing-api">{isZh ? '免费测试接口' : 'Free Testing API'}</Heading>
-				<p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
-					{isZh
-						? '以下免费测试接口仅供 PageAgent.js 和 PageAgent Extension 的技术评估和测试使用。'
-						: 'The following free testing endpoint is provided for testing and technical evaluation.'}
-				</p>
-				<div className="my-4 p-4 bg-amber-50 dark:bg-amber-950/20 rounded-lg border border-amber-200 dark:border-amber-800">
-					<p className="text-xs text-gray-600 dark:text-gray-400">
-						{isZh
-							? '⚠️ 仅供技术评估和研发用途，禁止用于生产环境。数据通过中国大陆服务器处理。请勿输入任何个人身份信息或敏感数据。使用即表示您同意'
-							: '⚠️ Strictly for technical evaluation and R&D only. Data is processed via servers in Mainland China. Do not input any PII or sensitive data. By using this API you agree to the'}{' '}
-						<a
-							href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-							target="_blank"
-							rel="noopener noreferrer"
-							className="text-blue-500 hover:underline"
-						>
-							{isZh ? '使用条款' : 'Terms of Use'}
-						</a>
-					</p>
-				</div>
-				<div className="bg-gray-50 dark:bg-gray-900/30 rounded-lg p-5 border border-gray-200 dark:border-gray-800">
-					<h3 className="font-semibold text-gray-900 dark:text-gray-100 mb-2">
-						Qwen (Alibaba Cloud China)
-					</h3>
-					<p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
-						{isZh
-							? '通过阿里云函数计算（中国大陆）转发至百炼 Qwen 模型'
-							: 'Proxied via Alibaba Cloud FC (Mainland China) to BaiLian Qwen models'}
-						{' · '}
-						<a
-							href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-							target="_blank"
-							rel="noopener noreferrer"
-							className="text-blue-500 hover:underline"
-						>
-							{isZh ? '使用条款' : 'Terms of Use'}
-						</a>
-					</p>
-					<CodeEditor
-						code={`# qwen3.5-plus / qwen3.5-flash
-LLM_BASE_URL="https://page-ag-testing-ohftxirgbn.cn-shanghai.fcapp.run"
-LLM_MODEL_NAME="qwen3.5-plus"`}
-					/>
-				</div>
 			</section>
 
 			<section className="mb-10">
@@ -308,43 +244,6 @@ LLM_MODEL_NAME="qwen3.5-plus"`}
 });`}
 						/>
 					</section>
-					<section>
-						<Heading id="prompt-caching-qwen" level={3}>
-							{isZh ? '阿里云百炼 Qwen' : 'Alibaba Cloud Bailian Qwen'}
-						</Heading>
-						<CodeEditor
-							language="typescript"
-							code={`const pageAgent = new PageAgent({
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-  apiKey: 'your-api-key',
-  model: 'qwen3.5-plus',
-  transformRequestBody: (requestBody) => {
-    const [systemMessage, ...restMessages] = requestBody.messages
-
-    if (systemMessage.role !== 'system' || typeof systemMessage.content !== 'string') {
-      return requestBody
-    }
-
-    return {
-      ...requestBody,
-      messages: [
-        {
-          ...systemMessage,
-          content: [
-            {
-              type: 'text',
-              text: systemMessage.content,
-              cache_control: { type: 'ephemeral' },
-            },
-          ],
-        },
-        ...restMessages,
-      ],
-    }
-  },
-});`}
-						/>
-					</section>
 				</div>
 			</section>
 
@@ -393,13 +292,13 @@ LLM_MODEL_NAME="qwen3.5-plus"`}
 							code={`// Local OpenAI-compatible runtime - no apiKey needed
 const pageAgent = new PageAgent({
   baseURL: 'http://localhost:11434/v1',
-  model: 'qwen3:14b'
+  model: 'llama3.1:8b'
 });
 
 // Or connect to LM Studio
 const lmStudioAgent = new PageAgent({
   baseURL: 'http://127.0.0.1:1234/v1',
-  model: 'qwen/qwen3.5-27b'
+  model: 'meta-llama-3.1-8b-instruct'
 });
 `}
 						/>
@@ -411,12 +310,12 @@ const lmStudioAgent = new PageAgent({
 						</Heading>
 						<p className="text-sm text-gray-600 dark:text-gray-400 mb-4">
 							{isZh
-								? '已在 Ollama 0.15 + qwen3:14b (RTX3090 24GB) 上测试通过。'
-								: 'Tested on Ollama 0.15 with qwen3:14b (RTX3090 24GB).'}
+								? '请使用支持 tool_call 的本地模型并根据硬件调整上下文窗口。'
+								: 'Use a local model with tool-call support and size the context window for your hardware.'}
 						</p>
 						<CodeEditor
 							code={`LLM_BASE_URL="http://localhost:11434/v1"
-LLM_MODEL_NAME="qwen3:14b"`}
+LLM_MODEL_NAME="llama3.1:8b"`}
 						/>
 						<div className="mt-4 p-4 bg-amber-50 dark:bg-amber-950/20 rounded-lg border border-amber-200 dark:border-amber-800">
 							<h3 className="font-semibold text-amber-900 dark:text-amber-200 mb-2">
@@ -463,7 +362,7 @@ LLM_MODEL_NAME="qwen3:14b"`}
 						</Heading>
 						<CodeEditor
 							code={`LLM_BASE_URL="http://127.0.0.1:1234/v1"
-LLM_MODEL_NAME="qwen/qwen3.5-27b"`}
+LLM_MODEL_NAME="meta-llama-3.1-8b-instruct"`}
 						/>
 						<div className="mt-4 p-4 bg-amber-50 dark:bg-amber-950/20 rounded-lg border border-amber-200 dark:border-amber-800">
 							<h3 className="font-semibold text-amber-900 dark:text-amber-200 mb-2">

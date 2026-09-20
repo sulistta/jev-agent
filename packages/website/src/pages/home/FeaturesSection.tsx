@@ -17,7 +17,7 @@ const LLM_CLOUD: {
 }[] = [
 	{ name: 'OpenAI', color: '#10b981', x: 18, y: 22, size: 1.5, opacity: 1 },
 	{ name: 'Claude', color: '#f97316', x: 58, y: 15, size: 1.35, opacity: 0.95 },
-	{ name: 'Qwen', color: '#8b5cf6', x: 35, y: 50, size: 1.8, opacity: 0.9 },
+	{ name: 'OpenRouter', color: '#8b5cf6', x: 35, y: 50, size: 1.35, opacity: 0.9 },
 	{ name: 'Gemini', color: '#3b82f6', x: 72, y: 48, size: 1.2, opacity: 0.85 },
 	{ name: 'DeepSeek', color: '#06b6d4', x: 13, y: 65, size: 1.1, opacity: 0.8 },
 	{ name: 'Grok', color: '#f43f5e', x: 52, y: 78, size: 1.0, opacity: 0.75 },
@@ -219,8 +219,8 @@ export default function FeaturesSection() {
 									</div>
 									<p className="text-sm text-gray-500 dark:text-gray-300 leading-relaxed">
 										{isZh
-											? 'OpenAI、Claude、DeepSeek、Qwen 等，或通过 Ollama 完全离线。'
-											: 'OpenAI, Claude, DeepSeek, Qwen, and more — or fully offline via Ollama.'}
+											? 'OpenAI、Claude、DeepSeek、OpenRouter 等，或通过 Ollama 完全离线。'
+											: 'OpenAI, Claude, DeepSeek, OpenRouter, and more — or fully offline via Ollama.'}
 									</p>
 								</div>
 							</div>

@@ -11,7 +11,7 @@ export default function QuickStart() {
 		isZh ? 'china' : 'international'
 	)
 	const cdnBase = cdnSource === 'china' ? CDN_DEMO_CN_URL : CDN_DEMO_URL
-	const cdnUrl = `${cdnBase}?lang=${isZh ? 'zh-CN' : 'en-US'}`
+	const cdnUrl = `${cdnBase}?lang=${isZh ? 'zh-CN' : 'en-US'}&autoInit=false`
 
 	return (
 		<div>
@@ -29,38 +29,8 @@ export default function QuickStart() {
 				{/* Demo CDN - One Line */}
 				<div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
 					<h3 className="text-lg font-semibold mb-2 text-blue-900 dark:text-blue-300">
-						{isZh ? '🚀 快速体验（Demo CDN）' : '🚀 Quick Try (Demo CDN)'}
+						{isZh ? '🚀 CDN 脚本' : '🚀 CDN Script'}
 					</h3>
-					<div className="bg-yellow-50 dark:bg-yellow-900/20 p-2 rounded mb-3 text-sm">
-						<span className="text-yellow-800 dark:text-yellow-200">
-							⚠️{' '}
-							{isZh ? (
-								<>
-									该 Demo CDN 使用了免费的测试 LLM API，使用即表示您同意其
-									<a
-										href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-										target="_blank"
-										rel="noopener noreferrer"
-										className="underline"
-									>
-										使用条款
-									</a>
-								</>
-							) : (
-								<>
-									This demo CDN uses our free testing LLM API. By using it you agree to the{' '}
-									<a
-										href="https://github.com/alibaba/page-agent/blob/main/docs/terms-and-privacy.md#2-testing-api-and-demo-disclaimer--terms-of-use"
-										target="_blank"
-										rel="noopener noreferrer"
-										className="underline"
-									>
-										Terms of Use
-									</a>
-								</>
-							)}
-						</span>
-					</div>
 					<div className="flex items-center gap-2 text-sm">
 						<label htmlFor="cdn-source" className="text-gray-700 dark:text-gray-300">
 							{isZh ? '镜像：' : 'Mirror:'}
@@ -81,8 +51,8 @@ export default function QuickStart() {
 					/>
 					<p className="text-sm text-gray-600 dark:text-gray-300">
 						{isZh
-							? '添加 autoInit=false 参数可只加载脚本，不自动创建 Demo Agent，之后可通过 new window.PageAgent(...) 手动初始化，并使用自定义 LLM。'
-							: 'Add the autoInit=false parameter to load the script without creating the demo agent automatically. You can then instantiate it with new window.PageAgent(...) and your own LLMs.'}
+							? '此脚本不包含模型或 API Key。使用 new window.PageAgent(...) 并配置自己的 OpenAI-compatible 服务。'
+							: 'This script includes no model or API key. Instantiate new window.PageAgent(...) with your own OpenAI-compatible provider.'}
 					</p>
 				</div>
 
@@ -105,8 +75,8 @@ import { PageAgent } from 'page-agent'`}
 					</h3>
 					<CodeEditor
 						code={`const agent = new PageAgent({
-  model: 'qwen3.5-plus',
-  baseURL: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+  model: 'openrouter/free',
+  baseURL: 'https://openrouter.ai/api/v1',
   apiKey: 'YOUR_API_KEY',
   language: '${isZh ? 'zh-CN' : 'en-US'}'
 })`}
