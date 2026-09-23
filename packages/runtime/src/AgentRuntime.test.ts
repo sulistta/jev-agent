@@ -106,7 +106,79 @@ function dependencies(verifier: RuntimeDependencies['verifier']): RuntimeDepende
 }
 
 describe('AgentRuntime', () => {
-	it('plans browser work and completes research only from source-backed coverage', async () => {
+	it('executes a semantic locate-identify-act plan as one complete operational goal', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.semanticText = {
+			plan: vi.fn(async () => ({
+				version: 1 as const,
+				canonicalGoal: 'Like the second oldest video on the requested channel',
+				originalLanguage: 'pt-BR',
+				missingInputs: [],
+				workItems: [
+					{
+						workItemId: 'locate-channel',
+						description: 'Locate the channel',
+						kind: 'navigate' as const,
+						required: true,
+						dependsOn: [],
+						status: 'pending' as const,
+					},
+					{
+						workItemId: 'identify-target',
+						description: 'Identify the second oldest video',
+						kind: 'navigate' as const,
+						required: true,
+						dependsOn: ['locate-channel'],
+						status: 'pending' as const,
+					},
+					{
+						workItemId: 'like-target',
+						description: 'Like the identified video',
+						successCriteria: ['The second oldest video is liked'],
+						kind: 'interact' as const,
+						required: true,
+						dependsOn: ['identify-target'],
+						status: 'pending' as const,
+					},
+				],
+				coverage: [],
+				deliverable: 'The requested video is liked',
+				externalActions: ['Like the requested video'],
+			})),
+			generate: vi.fn(async () => ({ text: 'Concluído.' })),
+		}
+		let decidedGoal: unknown
+		deps.decisions.decide = vi.fn(async ({ goal }) => {
+			decidedGoal = goal
+			return { kind: 'goal_satisfied' as const }
+		})
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'vai no canal e dê like no segundo vídeo mais antigo',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(decidedGoal).toMatchObject({
+			goalId: 'runtime:operation',
+			description: 'Like the second oldest video on the requested channel',
+		})
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			plan: {
+				workItems: [
+					expect.objectContaining({
+						workItemId: 'runtime:operation',
+						sourceWorkItemIds: ['locate-channel', 'identify-target', 'like-target'],
+						status: 'satisfied',
+					}),
+				],
+			},
+		})
+	})
+
+	it('requires Jev completion after source-backed research coverage is collected', async () => {
 		const deps = dependencies({
 			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
 		})
@@ -168,6 +240,7 @@ describe('AgentRuntime', () => {
 			]),
 			generate: vi.fn(async () => ({ text: 'Found Hotel Aurora with a verified source.' })),
 		}
+		deps.decisions.decide = vi.fn(async () => ({ kind: 'goal_satisfied' as const }))
 		const runtime = createAgentRuntime(deps)
 		const handle = await runtime.start({
 			request: 'Find one hotel',
@@ -178,7 +251,7 @@ describe('AgentRuntime', () => {
 			status: 'completed',
 			finalResponse: 'Found Hotel Aurora with a verified source.',
 		})
-		expect(Reflect.get(deps.decisions, 'decide')).not.toHaveBeenCalled()
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(1)
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledWith(
 			expect.objectContaining({ scope: 'document', includeNonInteractive: true }),
 			expect.any(AbortSignal)
@@ -370,6 +443,7 @@ describe('AgentRuntime', () => {
 			},
 			observedSignals: [],
 		})
+		deps.browser.execute = vi.fn(deps.browser.execute.bind(deps.browser))
 		deps.browser.waitFor = vi.fn(deps.browser.waitFor.bind(deps.browser))
 		const runtime = createAgentRuntime(deps)
 		const handle = await runtime.start({
@@ -388,6 +462,10 @@ describe('AgentRuntime', () => {
 		})
 		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
 		expect(Reflect.get(deps.browser, 'waitFor')).not.toHaveBeenCalled()
+		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledWith(
+			expect.objectContaining({ tabId: 'in-page', action: expect.objectContaining({ type: 'scroll' }) }),
+			expect.any(AbortSignal)
+		)
 	})
 
 	it('publishes action completion before waiting for page stabilization', async () => {
@@ -437,6 +515,72 @@ describe('AgentRuntime', () => {
 		)
 	})
 
+	it('observes the post-action state when synchronization signals were missed', async () => {
+		let verificationCount = 0
+		const deps = dependencies({
+			verify: vi.fn(async () => ({
+				status: ++verificationCount === 1 ? ('inconclusive' as const) : ('satisfied' as const),
+				evidence: [],
+			})),
+		})
+		deps.browser.waitFor = vi.fn(async () => ({
+			status: 'timeout' as const,
+			signals: [],
+			endedAt: '2026-09-19T10:00:12.000Z',
+		}))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Click save',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'goal',
+					description: 'Click save',
+					required: true,
+					status: 'pending',
+					evidenceIds: [],
+					outcome: { kind: 'predicate', predicate: { kind: 'text.contains', text: 'done' } },
+				},
+			],
+		})
+
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.browser, 'waitFor')).toHaveBeenCalledTimes(1)
+		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(2)
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(1)
+	})
+
+	it('blocks a no-transition decision once without semantic waiting or replanning', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.decisions.decide = vi.fn(async () => ({
+			kind: 'blocked' as const,
+			reason: 'No valid transition is available',
+		}))
+		deps.browser.waitFor = vi.fn(deps.browser.waitFor.bind(deps.browser))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Wait for the result',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'goal',
+					description: 'Wait for the result',
+					required: true,
+					status: 'pending',
+					evidenceIds: [],
+					outcome: { kind: 'predicate', predicate: { kind: 'text.contains', text: 'done' } },
+				},
+			],
+		})
+
+		await expect(handle.result).resolves.toMatchObject({ status: 'blocked' })
+		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(1)
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(1)
+		expect(Reflect.get(deps.browser, 'waitFor')).not.toHaveBeenCalled()
+	})
+
 	it('runs observe, decide, authorize, execute, and verify as one session flow', async () => {
 		let verificationCount = 0
 		const deps = dependencies({
@@ -481,11 +625,58 @@ describe('AgentRuntime', () => {
 		})
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(2)
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledWith(
-			expect.objectContaining({ scope: 'viewport', includeNonInteractive: false }),
+			expect.objectContaining({ scope: 'viewport', includeNonInteractive: true }),
 			expect.any(AbortSignal)
 		)
 		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledTimes(1)
 		await expect(runtime.getSession(handle.id)).resolves.toMatchObject({ status: 'completed' })
+	})
+
+	it('persists the selected control as session-local action memory', async () => {
+		let checks = 0
+		const deps = dependencies({
+			verify: async () =>
+				++checks === 1
+					? { status: 'inconclusive' as const, evidence: [] }
+					: { status: 'satisfied' as const, evidence: [] },
+		})
+		deps.decisions.decide = vi.fn(async () => ({
+			kind: 'action' as const,
+			candidateId: 'candidate:like',
+			selection: {
+				action: 'click',
+				label: 'click Like this video',
+				candidateSignature: 'candidate:like',
+				observationSignature: 'observation:video',
+				page: { url: 'https://example.test/video', title: 'Video' },
+			},
+			action: { type: 'click' as const, target: ref },
+		}))
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Like the video',
+			owner: { kind: 'in_page', ownerId: 'owner-1' },
+			goals: [
+				{
+					goalId: 'like',
+					description: 'Like the video',
+					required: true,
+					outcome: { kind: 'predicate', predicate: { kind: 'text.contains', text: 'liked' } },
+					status: 'pending',
+					evidenceIds: [],
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			actionJournal: [
+				expect.objectContaining({
+					workItemId: 'like',
+					label: 'click Like this video',
+					selection: expect.objectContaining({ candidateSignature: 'candidate:like' }),
+				}),
+			],
+		})
 	})
 
 	it('re-observes instead of executing an element reference replaced by a dynamic page', async () => {
@@ -520,6 +711,7 @@ describe('AgentRuntime', () => {
 		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
 		expect(Reflect.get(deps.browser, 'execute')).not.toHaveBeenCalled()
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(2)
+		expect((await deps.sessions.get(handle.id))?.decisionFingerprints).toBeUndefined()
 	})
 
 	it('does not spend the no-progress allowance when a dynamic target is replaced', async () => {
@@ -535,6 +727,12 @@ describe('AgentRuntime', () => {
 			status: ++validationCount === 1 ? ('missing' as const) : ('fresh' as const),
 			ref: elementRef,
 			reason: validationCount === 1 ? 'target was remounted' : undefined,
+		}))
+		deps.decisions.decide = vi.fn(async () => ({
+			kind: 'action' as const,
+			candidateId: 'candidate-1',
+			fingerprint: 'decision:dynamic-result',
+			action: { type: 'click' as const, target: ref },
 		}))
 		const runtime = createAgentRuntime(deps)
 		const handle = await runtime.start({
@@ -556,6 +754,9 @@ describe('AgentRuntime', () => {
 		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
 		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledTimes(1)
 		expect(Reflect.get(deps.browser, 'observe')).toHaveBeenCalledTimes(3)
+		await expect(deps.sessions.get(handle.id)).resolves.toMatchObject({
+			decisionFingerprints: ['decision:dynamic-result'],
+		})
 	})
 
 	it('starts an extension session on its explicit initial tab', async () => {

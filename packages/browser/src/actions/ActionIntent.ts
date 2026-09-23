@@ -24,6 +24,7 @@ export interface BrowserActionRequest {
 	sessionId: string
 	actionId: string
 	expectedSessionRevision: number
+	tabId?: string
 	action: BrowserAction
 }
 

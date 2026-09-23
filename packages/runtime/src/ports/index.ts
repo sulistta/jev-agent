@@ -6,6 +6,7 @@ import type {
 	DecisionNeed,
 	Evidence,
 	EvidenceItem,
+	ActionSelection,
 	GoalContract,
 	Session,
 	TaskContract,
@@ -47,19 +48,35 @@ export interface SessionStore {
 export interface DecisionResult {
 	kind:
 		| 'action'
-		| 'observe'
 		| 'clarify'
 		| 'confirm'
-		| 'replan'
 		| 'goal_satisfied'
 		| 'blocked'
 		| 'failed'
 	candidateId?: string
+	selection?: ActionSelection
 	action?: BrowserAction
 	evidence?: Evidence[]
 	reason?: string
 	error?: RuntimeError
 	fingerprint?: string
+	diagnostics?: DecisionDiagnostics
+}
+
+export interface DecisionDiagnostics {
+	primitive: 'choice' | 'noul'
+	candidateCount: number
+	operation?: string
+	targetStrategy?: 'choice' | 'noul' | 'none'
+	requestCount?: number
+	batchCount?: number
+	stateBytes?: number
+	inputTokens?: number
+	outputTokens?: number
+	selectedTransition?: 'action' | 'complete' | 'none'
+	selectedOptionId?: string
+	selectedProbability?: number
+	confidence?: number
 }
 
 export interface DecisionRouter {

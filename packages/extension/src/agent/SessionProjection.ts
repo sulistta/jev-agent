@@ -17,14 +17,16 @@ export function projectSessionEvent(
 				return history
 			return [...history, { type: 'assistant_message', text: message, purpose }]
 		}
-		case 'decision.selected':
+		case 'decision.selected': {
+			const candidateLabel = text(payload.candidateLabel)
 			return [
 				...history,
 				{
 					type: 'observation',
-					content: `Decision: ${text(payload.kind) ?? 'unknown'}. ${text(payload.reason) ?? ''}`,
+					content: `Decision: ${text(payload.kind) ?? 'unknown'}. ${text(payload.reason) ?? ''}${candidateLabel ? ` Selected: ${candidateLabel}.` : ''}`,
 				},
 			]
+		}
 		case 'session.status_changed':
 			if (payload.status === 'waiting_user' || payload.status === 'paused')
 				return [

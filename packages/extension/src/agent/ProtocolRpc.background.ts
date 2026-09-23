@@ -97,6 +97,24 @@ export function handleContentDocumentHello(
 	}
 }
 
+/**
+ * Drop document endpoints as soon as Chrome starts replacing a document.
+ * A tab can keep the same id across navigations, so retaining the old
+ * endpoint makes a synchronization request race the old content script.
+ */
+export function registerProtocolTabLifecycle(): void {
+	chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+		// A URL-only update can be an SPA route change, where the current content
+		// script remains valid. Chrome's loading transition identifies a document
+		// replacement without invalidating same-document navigation endpoints.
+		if (changeInfo.status === 'loading') documentEndpoints.delete(tabId)
+	})
+	chrome.tabs.onRemoved.addListener((tabId) => {
+		documentEndpoints.delete(tabId)
+		documentEndpointWaiters.delete(tabId)
+	})
+}
+
 async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> {
 	if (request.type === 'dom.execute' && isTabAction(request.action)) {
 		return executeTabAction(request)
@@ -106,15 +124,34 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 	if (tabId === undefined)
 		return failure('CONTENT_SCRIPT_UNAVAILABLE', 'DOM request has no target tab', true)
 	const endpoint = documentEndpoints.get(tabId)
+	const waitDeadline =
+		request.type === 'dom.wait' ? Date.now() + Math.max(0, request.maxWaitMs) : undefined
 	const referencedDocumentId = referencedDocument(request)
 	if (endpoint && referencedDocumentId && endpoint.documentId !== referencedDocumentId) {
 		return failure('DOCUMENT_CHANGED', 'Request targets a previous document instance', true)
 	}
-	const tab = await chrome.tabs.get(tabId)
+	let tab = await chrome.tabs.get(tabId)
 	if (isBootstrapTab(tab.url)) {
 		if (request.type === 'dom.observe') return success(bootstrapObservation(request, tabId, tab))
-		if (request.type === 'dom.wait')
-			return success(await waitForBootstrapNavigation(tabId, request.maxWaitMs))
+		if (request.type === 'dom.wait') {
+			const deadline = Date.now() + Math.max(0, request.maxWaitMs)
+			const navigation = await waitForBootstrapNavigation(tabId, request.maxWaitMs)
+			if (navigation.status === 'timeout') return success(navigation)
+
+			// Leaving chrome://newtab only means that navigation started. Continue
+			// through the normal content-script handshake and DOM quiet-window wait
+			// before allowing the runtime to observe the destination.
+			try {
+				await waitForDocumentEndpoint(tabId, remainingWaitMs(deadline))
+			} catch {
+				return success({
+					status: 'timeout',
+					signals: navigation.signals,
+					endedAt: new Date().toISOString(),
+				})
+			}
+			tab = await chrome.tabs.get(tabId)
+		}
 	}
 	if (!isContentScriptAllowed(tab.url)) {
 		return failure(
@@ -123,12 +160,14 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 			false
 		)
 	}
-	if (request.type === 'dom.wait' && !endpoint) {
+	let requestToForward = request
+	if (request.type === 'dom.wait' && !documentEndpoints.has(tabId)) {
 		try {
-			// A tab-created receipt is available before the newly injected content
-			// script can observe page stability. Wait for its document handshake;
-			// the forwarded wait then applies the normal DOM quiet window.
-			await waitForDocumentEndpoint(tabId, request.maxWaitMs)
+			// An absent endpoint after an executed action means Chrome is replacing
+			// the document. Its handshake proves the expected navigation occurred;
+			// the new document only needs its bounded readiness window.
+			await waitForDocumentEndpoint(tabId, remainingWaitMs(waitDeadline!))
+			requestToForward = settleCurrentDocumentRequest(request, waitDeadline!)
 		} catch {
 			return success({
 				status: 'timeout',
@@ -138,8 +177,9 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 		}
 	}
 
+	const forwardedEndpoint = documentEndpoints.get(tabId)
 	try {
-		return await forwardDomRequest(tabId, request)
+		return await forwardDomRequest(tabId, requestToForward)
 	} catch (error) {
 		if (request.type === 'dom.execute' && isClosedMessageChannelError(error)) {
 			return failure(
@@ -147,6 +187,23 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 				'The page changed before the action acknowledgement was delivered',
 				true
 			)
+		}
+		if (request.type === 'dom.wait' && isClosedMessageChannelError(error)) {
+			// The action navigated after the endpoint check but before the old
+			// content script answered. Do not reload: wait for the replacement
+			// document and settle that document instead.
+			if (documentEndpoints.get(tabId)?.documentId === forwardedEndpoint?.documentId)
+				documentEndpoints.delete(tabId)
+			try {
+				await waitForDocumentEndpoint(tabId, remainingWaitMs(waitDeadline!))
+				return await forwardDomRequest(tabId, settleCurrentDocumentRequest(request, waitDeadline!))
+			} catch {
+				return success({
+					status: 'timeout',
+					signals: [],
+					endedAt: new Date().toISOString(),
+				})
+			}
 		}
 		if (!isMissingReceiverError(error))
 			return failure('CONTENT_SCRIPT_UNAVAILABLE', errorMessage(error), true)
@@ -162,6 +219,17 @@ async function handleDom(request: DomRpcRequest): Promise<ExtensionRpcResponse> 
 		} catch (retryError) {
 			return failure('CONTENT_SCRIPT_UNAVAILABLE', errorMessage(retryError), true)
 		}
+	}
+}
+
+function settleCurrentDocumentRequest(
+	request: Extract<DomRpcRequest, { type: 'dom.wait' }>,
+	deadline: number
+): Extract<DomRpcRequest, { type: 'dom.wait' }> {
+	return {
+		...request,
+		expected: [],
+		maxWaitMs: remainingWaitMs(deadline),
 	}
 }
 
@@ -255,6 +323,10 @@ function waitForDocumentEndpoint(tabId: number, timeoutMs = 10_000): Promise<voi
 		waiters.add(onReady)
 		documentEndpointWaiters.set(tabId, waiters)
 	})
+}
+
+function remainingWaitMs(deadline: number): number {
+	return Math.max(0, deadline - Date.now())
 }
 
 async function handleTabs(request: TabRpcRequest): Promise<ExtensionRpcResponse> {
@@ -383,7 +455,7 @@ function domTargetTabId(request: DomRpcRequest): number | undefined {
 	if (request.type === 'dom.revalidate') return numberTabId(request.ref.tabId)
 	const action = request.action as unknown as BrowserAction
 	if ('target' in action && action.target) return numberTabId(action.target.tabId)
-	return undefined
+	return numberTabId(request.tabId)
 }
 
 function referencedDocument(request: DomRpcRequest): string | undefined {

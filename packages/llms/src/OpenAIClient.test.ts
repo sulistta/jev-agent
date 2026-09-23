@@ -212,6 +212,21 @@ describe('OpenAIClient.invoke — HTTP errors', () => {
 			message: expect.stringContaining('Internal Boom'),
 		})
 	})
+
+	it('preserves HTTP status and Retry-After metadata for rate limits', async () => {
+		const { client, fetchMock } = makeClient()
+		fetchMock.mockResolvedValue(
+			new Response(JSON.stringify({ error: { message: 'slow down' } }), {
+				status: 429,
+				headers: { 'Content-Type': 'application/json', 'Retry-After': '2.5' },
+			})
+		)
+		await expect(client.invoke([], tools, signal)).rejects.toMatchObject({
+			type: InvokeErrorTypes.RATE_LIMIT,
+			statusCode: 429,
+			retryAfterMs: 2_500,
+		})
+	})
 })
 
 // ---------- Response anomalies ----------

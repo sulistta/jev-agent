@@ -1,5 +1,5 @@
 import type { PageObservation } from '@page-agent/browser'
-import type { GoalContract, Session } from '@page-agent/runtime'
+import type { DecisionResult, GoalContract, Session } from '@page-agent/runtime'
 import { describe, expect, it } from 'vitest'
 
 import { JevDecisionProvider } from './JevDecisionProvider'
@@ -125,6 +125,26 @@ const need = {
 	requiredCapabilities: ['dom.write'],
 }
 
+function withExecutedAction(current: Session, decision: DecisionResult): Session {
+	if (decision.kind !== 'action' || !decision.selection) throw new Error('Expected selected action')
+	return {
+		...current,
+		actionJournal: [
+			...(current.actionJournal ?? []),
+			{
+				actionId: `action-${(current.actionJournal?.length ?? 0) + 1}`,
+				workItemId: goal.goalId,
+				action: decision.action?.type ?? 'click',
+				label: decision.selection.label,
+				selection: decision.selection,
+				status: 'executed',
+				observationId: decision.candidateId?.split(':')[0] ?? '',
+				completedAt: '2026-09-19T10:00:00.000Z',
+			},
+		],
+	}
+}
+
 describe('JevDecisionRouter', () => {
 	it('rejects unsafe semantic values before execution', () => {
 		expect(validateHttpUrl('https://example.test/path')).toBe('https://example.test/path')
@@ -155,6 +175,7 @@ describe('JevDecisionRouter', () => {
 		expect(result).toMatchObject({
 			kind: 'action',
 			candidateId: selectedId,
+			selection: { label: 'click Control 254' },
 			action: { type: 'click', target: { localId: 'index:254' } },
 		})
 		expect(transport.requests).toHaveLength(1)
@@ -219,6 +240,36 @@ describe('JevDecisionRouter', () => {
 					},
 					need,
 				},
+				new AbortController().signal
+			)
+		).resolves.toMatchObject({ action: { target: { localId: 'index:1' } } })
+	})
+
+	it('exposes collection positions and context to the action judgment', async () => {
+		const selectedId = 'observation-1:jev:click:index:1'
+		const transport = new MockJevTransport((request) => {
+			const options = request.questions[0].options
+			expect(options?.[0]).toMatchObject({
+				label: expect.stringContaining('collection item 1:'),
+			})
+			expect(options?.[1]).toMatchObject({
+				id: selectedId,
+				label: expect.stringContaining('collection item 2:'),
+			})
+			return choiceResponse(request, selectedId)
+		})
+		const elements = [element(0, 'Open'), element(1, 'Open')].map((item, index) => ({
+			...item,
+			collectionItem: {
+				collectionId: 'videos',
+				itemId: `video-${index + 1}`,
+				position: index + 1,
+				text: `Video ${index + 1} by the channel`,
+			},
+		}))
+		await expect(
+			new JevDecisionRouter(provider(transport)).decide(
+				{ session, goal, observation: { ...observation, elements }, need },
 				new AbortController().signal
 			)
 		).resolves.toMatchObject({ action: { target: { localId: 'index:1' } } })
@@ -425,9 +476,12 @@ describe('JevDecisionRouter', () => {
 			new AbortController().signal
 		)
 		await expect(
+			router.decide({ session, goal, observation, need }, new AbortController().signal)
+		).resolves.toMatchObject({ kind: 'action', candidateId: selectedId })
+		await expect(
 			router.decide(
 				{
-					session: { ...session, decisionFingerprints: [first.fingerprint!] },
+					session: withExecutedAction(session, first),
 					goal,
 					observation,
 					need,
@@ -436,9 +490,9 @@ describe('JevDecisionRouter', () => {
 			)
 		).resolves.toMatchObject({
 			kind: 'blocked',
-			reason: expect.stringContaining('already been attempted'),
+			reason: expect.stringContaining('already been executed'),
 		})
-		expect(transport.requests).toHaveLength(1)
+		expect(transport.requests).toHaveLength(2)
 	})
 
 	it('breaks an A-B-A cycle while allowing actions in a genuinely changed state', async () => {
@@ -471,33 +525,32 @@ describe('JevDecisionRouter', () => {
 		})
 		const router = new JevDecisionRouter(provider(transport))
 		const cycleElements = [element(0, 'Toggle menu'), element(1, 'Continue')]
-		await expect(
-			router.decide(
+		const first = await router.decide(
 				{ session, goal, observation: { ...observation, elements: cycleElements }, need },
 				new AbortController().signal
 			)
-		).resolves.toMatchObject({ candidateId: firstId })
+		expect(first).toMatchObject({ candidateId: firstId })
+		const afterFirst = withExecutedAction(session, first)
 		const changedObservation = {
 			...observation,
 			observationId: 'observation-2',
 			page: { ...observation.page, title: 'Menu open' },
 			elements: cycleElements,
 		}
-		await expect(
-			router.decide(
+		const second = await router.decide(
 				{
-					session,
+					session: afterFirst,
 					goal,
 					observation: changedObservation,
 					need,
 				},
 				new AbortController().signal
 			)
-		).resolves.toMatchObject({ kind: 'action', candidateId: changedStateId })
+		expect(second).toMatchObject({ kind: 'action', candidateId: changedStateId })
 		await expect(
 			router.decide(
 				{
-					session,
+					session: withExecutedAction(afterFirst, second),
 					goal,
 					observation: {
 						...observation,
@@ -534,13 +587,12 @@ describe('JevDecisionRouter', () => {
 			return choiceResponse(request, selectedId)
 		})
 		const router = new JevDecisionRouter(provider(transport))
-		await expect(
-			router.decide({ session, goal, observation, need }, new AbortController().signal)
-		).resolves.toMatchObject({ kind: 'action' })
+		const first = await router.decide({ session, goal, observation, need }, new AbortController().signal)
+		expect(first).toMatchObject({ kind: 'action' })
 		await expect(
 			router.decide(
 				{
-					session,
+					session: withExecutedAction(session, first),
 					goal,
 					observation: {
 						...observation,

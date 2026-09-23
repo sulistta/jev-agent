@@ -97,32 +97,41 @@ export class OpenAIClient implements LLMClient {
 				if ((error as any)?.name === 'AbortError') throw error
 			}
 			const errorMessage = errorData?.error?.message || response.statusText
+			const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
 
 			if (response.status === 401 || response.status === 403) {
-				throw new InvokeError(
+				throw httpError(
 					InvokeErrorTypes.AUTH_ERROR,
 					`Authentication failed: ${errorMessage}`,
-					errorData
+					response.status,
+					errorData,
+					retryAfterMs
 				)
 			}
 			if (response.status === 429) {
-				throw new InvokeError(
+				throw httpError(
 					InvokeErrorTypes.RATE_LIMIT,
 					`Rate limit exceeded: ${errorMessage}`,
-					errorData
+					response.status,
+					errorData,
+					retryAfterMs
 				)
 			}
 			if (response.status >= 500) {
-				throw new InvokeError(
+				throw httpError(
 					InvokeErrorTypes.SERVER_ERROR,
 					`Server error: ${errorMessage}`,
-					errorData
+					response.status,
+					errorData,
+					retryAfterMs
 				)
 			}
-			throw new InvokeError(
+			throw httpError(
 				InvokeErrorTypes.UNKNOWN,
 				`HTTP ${response.status}: ${errorMessage}`,
-				errorData
+				response.status,
+				errorData,
+				retryAfterMs
 			)
 		}
 
@@ -266,4 +275,28 @@ export class OpenAIClient implements LLMClient {
 			rawRequest: finalRequestBody,
 		}
 	}
+}
+
+function parseRetryAfter(value: string | null): number | undefined {
+	if (!value) return undefined
+
+	const seconds = Number(value)
+	if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000
+
+	const date = Date.parse(value)
+	if (Number.isNaN(date)) return undefined
+	return Math.max(0, date - Date.now())
+}
+
+function httpError(
+	type: ConstructorParameters<typeof InvokeError>[0],
+	message: string,
+	statusCode: number,
+	rawError: unknown,
+	retryAfterMs: number | undefined
+): InvokeError {
+	const error = new InvokeError(type, message, rawError)
+	error.statusCode = statusCode
+	error.retryAfterMs = retryAfterMs
+	return error
 }

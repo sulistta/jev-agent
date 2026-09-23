@@ -40,6 +40,8 @@ export class InvokeError extends Error {
 	type: InvokeErrorType
 	retryable: boolean
 	statusCode?: number
+	/** Delay requested by the provider before retrying this invocation. */
+	retryAfterMs?: number
 	/* raw error (provided if this error is caused by another error) */
 	rawError?: unknown
 	/* raw response from the API (provided if this error is caused by an API calling) */

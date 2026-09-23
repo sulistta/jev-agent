@@ -41,6 +41,7 @@ export class LLM extends EventTarget {
 	): Promise<InvokeResult> {
 		return await withRetry(async () => this.client.invoke(messages, tools, abortSignal, options), {
 			maxRetries: this.config.maxRetries,
+			abortSignal,
 			onRetry: (attempt, lastError) => {
 				this.dispatchEvent(
 					new CustomEvent('retry', {
@@ -59,6 +60,7 @@ async function withRetry<T>(
 	fn: () => Promise<T>,
 	settings: {
 		maxRetries: number
+		abortSignal?: AbortSignal
 		onRetry: (attempt: number, lastError: Error) => void
 	}
 ): Promise<T> {
@@ -75,9 +77,42 @@ async function withRetry<T>(
 			console.debug('[LLM] retryable failure, will retry:', error)
 			settings.onRetry(attempt, error as Error)
 
-			await new Promise((resolve) => setTimeout(resolve, 100))
+			await retryDelay(error, attempt, settings.abortSignal)
 		}
 	}
+}
+
+const MAX_PROVIDER_RETRY_DELAY_MS = 60_000
+
+async function retryDelay(error: unknown, attempt: number, signal?: AbortSignal): Promise<void> {
+	const providerDelay = error instanceof InvokeError ? error.retryAfterMs : undefined
+	const delayMs =
+		providerDelay === undefined
+			? Math.min(1_000 * 2 ** (attempt - 1), 10_000)
+			: Math.min(Math.max(providerDelay, 0), MAX_PROVIDER_RETRY_DELAY_MS)
+
+	if (delayMs === 0) {
+		signal?.throwIfAborted()
+		return
+	}
+
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener('abort', onAbort)
+			resolve()
+		}, delayMs)
+		const onAbort = () => {
+			clearTimeout(timer)
+			const reason = signal?.reason
+			reject(
+				reason instanceof Error
+					? reason
+					: new DOMException('The operation was aborted', 'AbortError')
+			)
+		}
+		if (signal?.aborted) onAbort()
+		else signal?.addEventListener('abort', onAbort, { once: true })
+	})
 }
 
 export function parseLLMConfig(config: LLMConfig): ResolvedLLMConfig {

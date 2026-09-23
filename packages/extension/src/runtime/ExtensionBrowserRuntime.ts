@@ -76,9 +76,10 @@ export class ExtensionBrowserRuntime implements BrowserRuntime {
 					type: 'dom.execute',
 					requestId: requestId(),
 					sessionId: request.sessionId,
-					actionId: request.actionId,
-					expectedSessionRevision: request.expectedSessionRevision,
-					action: serializeAction(request.action),
+						actionId: request.actionId,
+						expectedSessionRevision: request.expectedSessionRevision,
+						tabId: request.tabId,
+						action: serializeAction(request.action),
 				},
 				signal
 			)

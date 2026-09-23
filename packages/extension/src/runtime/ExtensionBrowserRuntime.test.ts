@@ -128,6 +128,31 @@ describe('ExtensionBrowserRuntime', () => {
 		expect(receipts).toHaveLength(1)
 	})
 
+	it('forwards the active tab for a scroll without an element target', async () => {
+		let sent: DomRpcRequest | TabRpcRequest | undefined
+		const runtime = new ExtensionBrowserRuntime({
+			request: async <T>(payload: DomRpcRequest | TabRpcRequest) => {
+				sent = payload
+				return { actionId: 'scroll-1', status: 'executed' } as T
+			},
+		})
+		await runtime.execute(
+			{
+				sessionId: 'session-1',
+				actionId: 'scroll-1',
+				expectedSessionRevision: 1,
+				tabId: '9191',
+				action: { type: 'scroll', axis: 'y', amount: { kind: 'pages', value: 1 } },
+			},
+			new AbortController().signal
+		)
+		expect(sent).toMatchObject({
+			type: 'dom.execute',
+			tabId: '9191',
+			action: { type: 'scroll', axis: 'y' },
+		})
+	})
+
 	it('turns a navigation-interrupted action response into a retryable receipt', async () => {
 		const runtime = new ExtensionBrowserRuntime({
 			request: async () => {

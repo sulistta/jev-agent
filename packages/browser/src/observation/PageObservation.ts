@@ -45,12 +45,19 @@ export interface ObservedElement {
 	placeholder?: string
 	valueState?: 'empty' | 'present' | 'masked'
 	regionId?: string
+	collectionItem?: {
+		collectionId: string
+		itemId: string
+		position: number
+		text: string
+	}
 	supportedActions?: ActionName[]
 	state?: {
 		visible: boolean
 		enabled: boolean
 		editable: boolean
 		checked?: boolean
+		pressed?: boolean
 		expanded?: boolean
 		selected?: boolean
 	}

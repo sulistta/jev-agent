@@ -32,6 +32,20 @@ describe('SessionProjection', () => {
 			{ content: expect.stringContaining('Waiting for user input') },
 		])
 	})
+
+	it('records the semantic label of the selected browser control', () => {
+		const history = projectSessionEvent(
+			[],
+			event('decision.selected', {
+				kind: 'action',
+				candidateLabel: 'click Like this video',
+			})
+		)
+		expect(history).toMatchObject([
+			{ content: expect.stringContaining('Selected: click Like this video') },
+		])
+	})
+
 	it('projects runtime actions into the existing timeline model', () => {
 		const started = projectSessionEvent([], event('action.started', { actionType: 'click' }))
 		const completed = projectSessionEvent(

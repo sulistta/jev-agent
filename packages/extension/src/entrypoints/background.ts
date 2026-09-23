@@ -1,6 +1,7 @@
 import {
 	handleContentDocumentHello,
 	handleProtocolRpcMessage,
+	registerProtocolTabLifecycle,
 } from '@/agent/ProtocolRpc.background'
 import {
 	createOriginGrant,
@@ -15,6 +16,7 @@ import { handleTabControlMessage } from '@/agent/TabsController.background'
 
 export default defineBackground(() => {
 	console.log('[Background] Service Worker started')
+	registerProtocolTabLifecycle()
 
 	chrome.runtime.onConnect.addListener((port) => {
 		if (port.name === 'page-agent-runner-v2') registerPublicRunnerPort(port)

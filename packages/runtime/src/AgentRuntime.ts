@@ -16,6 +16,8 @@ import type {
 	TaskWorkItem,
 } from './domain'
 import { type RuntimeError } from './errors/RuntimeError'
+import { researchCoverageSatisfied } from './outcomes/researchCoverage'
+import { compileTaskPlan } from './planning/compileTaskPlan'
 import { type RuntimeDependencies, createDefaultBudgets, createTaskContract } from './ports'
 import { isTerminalSessionStatus, transitionSession } from './session/state'
 
@@ -320,11 +322,6 @@ class SessionExecution implements SessionHandle {
 					stateBeforeLastExecutedAction = undefined
 				}
 				session = await this.collectEvidence(session, goal, observation)
-				if (researchGoalSatisfied(session, goal.goalId)) {
-					session = await this.updateGoal(session, goal.goalId, 'satisfied')
-					noProgress = 0
-					continue
-				}
 				session = await this.setPhase(session, 'verifying')
 				const verification = await this.dependencies.verifier.verify(
 					{ goal, observation },
@@ -369,22 +366,23 @@ class SessionExecution implements SessionHandle {
 					kind: decision.kind,
 					reason: decision.reason ?? '',
 					candidateId: decision.candidateId ?? '',
+					candidateLabel: decision.selection?.label ?? '',
+					primitive: decision.diagnostics?.primitive ?? '',
+					candidateCount: String(decision.diagnostics?.candidateCount ?? ''),
+					selectedOptionId: decision.diagnostics?.selectedOptionId ?? '',
+					selectedProbability: String(decision.diagnostics?.selectedProbability ?? ''),
+					confidence: String(decision.diagnostics?.confidence ?? ''),
+					selectedTransition: decision.diagnostics?.selectedTransition ?? '',
 				})
-				if (decision.fingerprint && !session.decisionFingerprints?.includes(decision.fingerprint))
-					session = await this.save({
-						...session,
-						decisionFingerprints: [
-							...(session.decisionFingerprints ?? []),
-							decision.fingerprint,
-						].slice(-100),
-					})
 
 				if (decision.kind === 'goal_satisfied') {
 					const workItem = workItemForGoal(session.plan, goal.goalId)
-					if (workItem?.kind === 'research' && !researchGoalSatisfied(session, goal.goalId)) {
-						noProgress += 1
-						continue
-					}
+					if (workItem?.kind === 'research' && !researchCoverageSatisfied(session, goal.goalId))
+						return await this.block(
+							session,
+							'RESEARCH_COVERAGE_INCOMPLETE',
+							'Jev reported this research goal as complete before its required verified coverage was collected.'
+						)
 					session = await this.updateGoal(session, goal.goalId, 'satisfied', decision.evidence)
 					noProgress = 0
 					continue
@@ -397,16 +395,9 @@ class SessionExecution implements SessionHandle {
 					continue
 				}
 				if (decision.kind === 'blocked')
-					return await this.block(session, 'POLICY_BLOCKED', decision.reason ?? 'Decision blocked')
+					return await this.block(session, 'NO_PROGRESS', decision.reason ?? 'Decision blocked')
 				if (decision.kind === 'failed')
 					return await this.fail(session, decision.reason ?? 'Decision failed')
-				if (decision.kind === 'replan') {
-					noProgress += 1
-					if (noProgress >= session.budgets.maxConsecutiveNoProgress) {
-						return await this.block(session, 'NO_PROGRESS', 'No progress after replanning')
-					}
-					continue
-				}
 				if (decision.kind !== 'action' || !decision.action) {
 					return await this.fail(
 						session,
@@ -511,12 +502,14 @@ class SessionExecution implements SessionHandle {
 				await this.emit(session.sessionId, 'action.started', {
 					actionId,
 					actionType: action.type,
+					candidateLabel: decision.selection?.label ?? '',
 				})
 				const receipt = await this.dependencies.browser.execute(
 					{
 						actionId,
 						sessionId: session.sessionId,
 						expectedSessionRevision: observation.revision,
+						tabId: session.browserScope.activeTabId,
 						action,
 					},
 					this.abortController.signal
@@ -562,15 +555,31 @@ class SessionExecution implements SessionHandle {
 					actionId: receipt.actionId,
 					workItemId: goal.goalId,
 					action: action.type,
-					label: decision.candidateId ?? action.type,
+					label: decision.selection?.label ?? action.type,
+					selection: decision.selection,
 					status: receipt.status === 'executed' ? 'executed' : 'failed',
 					observationId: observation.observationId,
 					completedAt: receipt.endedAt,
 				}
 				session = await this.save({
 					...session,
-					actionJournal: [...(session.actionJournal ?? []), journalEntry].slice(-200),
+					actionJournal: [...(session.actionJournal ?? []), journalEntry],
+					decisionFingerprints:
+						decision.fingerprint &&
+						!session.decisionFingerprints?.includes(decision.fingerprint)
+							? [...(session.decisionFingerprints ?? []), decision.fingerprint]
+							: (session.decisionFingerprints ?? []),
 				})
+				if (receipt.status !== 'executed') {
+					noProgress += 1
+					if (noProgress >= session.budgets.maxConsecutiveNoProgress)
+						return await this.block(
+							session,
+							'NO_PROGRESS',
+							receipt.error?.message ?? 'Action made no progress'
+						)
+					continue
+				}
 				session = await this.setPhase(session, 'settling')
 				const synchronization = tabEffectConfirmsAction(receipt, action)
 					? {
@@ -584,25 +593,27 @@ class SessionExecution implements SessionHandle {
 								tabId: session.browserScope.activeTabId ?? 'in-page',
 								since: receipt.startedAt,
 								expected: expectedChanges(action),
-								settle: { quietWindowMs: 500, maxWaitMs: 10_000 },
+								settle: {
+									quietWindowMs: 500,
+									maxWaitMs: action.type === 'tab.open' ? 10_000 : 2_000,
+								},
 							},
 							this.abortController.signal
 						)
 				await this.emit(session.sessionId, 'synchronization.completed', {
 					status: synchronization.status,
 				})
-				if (receipt.status === 'executed') {
-					stateBeforeLastExecutedAction = observationFingerprint
-					continue
-				}
-				noProgress += 1
-				if (noProgress >= session.budgets.maxConsecutiveNoProgress) {
-					return await this.block(
+				if (synchronization.status === 'error')
+					return await this.fail(
 						session,
-						'NO_PROGRESS',
-						receipt.error?.message ?? 'Action made no progress'
+						`Browser synchronization failed: ${synchronization.error.code}: ${synchronization.error.message}`
 					)
-				}
+				if (synchronization.status === 'cancelled') this.assertNotCancelled()
+				// Signals are an optimization, not proof of effect. A route or DOM update
+				// can complete between the action receipt and wait subscription. Observe
+				// the current state and compare it with the pre-action fingerprint.
+				stateBeforeLastExecutedAction = observationFingerprint
+				continue
 			}
 		} catch (error) {
 			const session = await this.currentSession()
@@ -632,10 +643,12 @@ class SessionExecution implements SessionHandle {
 		while (true) {
 			if (!session.plan) {
 				session = await this.setPhase(session, 'planning')
-				const plan = await semanticText.plan(
+				const semanticPlan = await semanticText.plan(
 					{ request: session.task.request, conversation: session.conversation ?? [] },
 					this.abortController.signal
 				)
+				validatePlan(semanticPlan)
+				const plan = compileTaskPlan(semanticPlan)
 				validatePlan(plan)
 				session = await this.save({
 					...session,
@@ -644,6 +657,8 @@ class SessionExecution implements SessionHandle {
 					decisionFingerprints: [],
 				})
 				await this.emit(session.sessionId, 'plan.created', {
+					sourceWorkItems: String(semanticPlan.workItems.length),
+					executableWorkItems: String(plan.workItems.length),
 					workItems: String(plan.workItems.length),
 					missingInputs: String(plan.missingInputs.length),
 				})
@@ -712,7 +727,9 @@ class SessionExecution implements SessionHandle {
 				tabId: session.browserScope.activeTabId ?? 'in-page',
 				scope: workItem?.kind === 'research' ? 'document' : 'viewport',
 				includeText: true,
-				includeNonInteractive: workItem?.kind === 'research',
+				// Browser tasks need viewport headings and labels to relate controls
+				// to the surrounding item or section they affect.
+				includeNonInteractive: true,
 				attributes: [],
 				sensitivityPolicyId: 'default',
 			},
@@ -1122,43 +1139,6 @@ function validatePlan(plan: TaskPlan): void {
 	}
 }
 
-function researchGoalSatisfied(session: Session, goalId: string): boolean {
-	const workItem = workItemForGoal(session.plan, goalId)
-	if (!workItem || workItem.kind !== 'research' || !session.plan) return false
-	const requirements = session.plan.coverage.filter(
-		(requirement) => requirement.workItemId === workItem.workItemId
-	)
-	return (
-		requirements.length > 0 &&
-		requirements.every((requirement) => {
-			const matching = (session.evidence ?? []).filter(
-				(item) =>
-					item.workItemId === workItem.workItemId &&
-					item.verification === 'verified' &&
-					(requirement.requiredTags ?? []).every((tag) => item.tags.includes(tag))
-			)
-			if (!requirement.distinctBy) return matching.length >= requirement.minimum
-			const values = new Set(
-				matching
-					.map((item) => evidenceDistinctValue(item, requirement.distinctBy!))
-					.filter((value) => value !== undefined)
-					.map((value) => JSON.stringify(value))
-			)
-			return values.size >= requirement.minimum
-		})
-	)
-}
-
-function evidenceDistinctValue(
-	item: EvidenceItem,
-	field: string
-): import('@page-agent/protocol').JsonValue | undefined {
-	if (field === 'entityName') return item.entityName
-	if (field === 'source.origin' || field === 'origin') return item.source.origin
-	if (field === 'source.url' || field === 'url') return item.source.url
-	return item.attributes[field]
-}
-
 function extractionFingerprint(workItemId: string, observation: PageObservation): string {
 	return stableHash(
 		[
@@ -1173,6 +1153,7 @@ function runtimeObservationFingerprint(observation: PageObservation): string {
 	return stableHash(
 		JSON.stringify({
 			page: observation.page,
+			viewport: observation.viewport,
 			content: (observation.content ?? []).map((block) => block.contentHash),
 			elements: observation.elements.map((element) => ({
 				tagName: element.tagName,
@@ -1181,6 +1162,8 @@ function runtimeObservationFingerprint(observation: PageObservation): string {
 				text: element.text,
 				valueState: element.valueState,
 				href: element.attributes.href,
+				checked: element.state?.checked,
+				pressed: element.state?.pressed,
 				selected: element.state?.selected,
 				expanded: element.state?.expanded,
 			})),

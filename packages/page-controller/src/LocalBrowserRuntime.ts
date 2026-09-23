@@ -183,6 +183,8 @@ function stableAttributes(element: HTMLElement): Record<string, string> {
 	}
 	const href = publicHref(element)
 	if (href) attributes.href = href
+	const hrefIdentity = privateHrefIdentity(element)
+	if (hrefIdentity) attributes.hrefIdentity = hrefIdentity
 	return attributes
 }
 
@@ -195,6 +197,52 @@ function publicHref(element: HTMLElement): string | undefined {
 		return `${url.origin}${url.pathname}`.slice(0, 500)
 	} catch {
 		return undefined
+	}
+}
+
+function privateHrefIdentity(element: HTMLElement): string | undefined {
+	const rawHref = element.getAttribute('href')
+	if (!rawHref) return undefined
+	try {
+		const url = new URL(rawHref, window.location.href)
+		if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+		return shortHash(url.href)
+	} catch {
+		return undefined
+	}
+}
+
+function collectionItemFor(
+	element: HTMLElement
+): PageObservation['elements'][number]['collectionItem'] {
+	let item = element.closest<HTMLElement>('li, article, [role="listitem"], [role="row"]')
+	if (!item) {
+		let ancestor = element.parentElement
+		while (ancestor && ancestor !== document.body) {
+			const siblings = Array.from(ancestor.parentElement?.children ?? [])
+			if (
+				ancestor.querySelector('a[href]') &&
+				siblings.filter(
+					(sibling) => sibling.tagName === ancestor?.tagName && sibling.querySelector('a[href]')
+				).length > 1
+			) {
+				item = ancestor
+				break
+			}
+			ancestor = ancestor.parentElement
+		}
+	}
+	const parent = item?.parentElement
+	if (!item || !parent) return undefined
+	const items = Array.from(parent.children).filter((sibling) => sibling.tagName === item.tagName)
+	const containers = Array.from(document.querySelectorAll(parent.tagName))
+	const collectionId = `collection:${parent.tagName.toLowerCase()}:${containers.indexOf(parent)}`
+	const position = items.indexOf(item) + 1
+	return {
+		collectionId,
+		itemId: `${collectionId}:item:${position}`,
+		position,
+		text: (item.textContent ?? '').replace(/\s+/g, ' ').trim().slice(0, 1000),
 	}
 }
 
@@ -411,6 +459,8 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				placeholder: element.getAttribute('placeholder') ?? undefined,
 				valueState,
 				regionId,
+				collectionItem:
+					request.includeText && level === 'public' ? collectionItemFor(element) : undefined,
 				supportedActions,
 				state: {
 					visible: isVisible(element),
@@ -420,6 +470,10 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 						element instanceof HTMLInputElement && ['checkbox', 'radio'].includes(element.type)
 							? element.checked
 							: undefined,
+					pressed:
+						element.getAttribute('aria-pressed') === null
+							? undefined
+							: element.getAttribute('aria-pressed') === 'true',
 					expanded:
 						element.getAttribute('aria-expanded') === null
 							? undefined
@@ -601,7 +655,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 
 		return new Promise((resolve) => {
 			const signals: BrowserSignal[] = [...recentSignals]
-			let quietTimer: ReturnType<typeof setTimeout> | undefined
+			let settleTimer: ReturnType<typeof setTimeout> | undefined
 			let finished = false
 			let expectedObserved = recentSignals.length > 0
 
@@ -609,7 +663,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				if (finished) return
 				finished = true
 				observer?.disconnect()
-				if (quietTimer) clearTimeout(quietTimer)
+				if (settleTimer) clearTimeout(settleTimer)
 				if (timeoutTimer) clearTimeout(timeoutTimer)
 				signal.removeEventListener('abort', onAbort)
 				window.removeEventListener('beforeunload', onNavigationStart)
@@ -621,15 +675,18 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				document.removeEventListener('change', onInputChange, true)
 				resolve(result)
 			}
-			const armQuietWindow = () => {
+			const armSettleWindow = () => {
 				if (
 					finished ||
-					document.readyState === 'loading' ||
+					settleTimer !== undefined ||
+					document.readyState !== 'complete' ||
 					(!expectedObserved && request.expected.length > 0)
 				)
 					return
-				if (quietTimer) clearTimeout(quietTimer)
-				quietTimer = setTimeout(
+				// Dynamic applications can mutate forever (timers, thumbnails, media and
+				// live regions). Once the expected effect is visible, use a bounded grace
+				// period before observing again instead of requiring global DOM silence.
+				settleTimer = setTimeout(
 					() =>
 						finish({
 							status: expectedObserved ? 'satisfied' : 'stabilized',
@@ -645,7 +702,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				expectedObserved ||= incoming.some((candidate) =>
 					request.expected.some((expected) => signalMatches(expected, candidate))
 				)
-				armQuietWindow()
+				armSettleWindow()
 			}
 			const observer =
 				typeof MutationObserver === 'undefined'
@@ -676,7 +733,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 					signalEvent('route.changed', { url: window.location.href }),
 					signalEvent('navigation.completed', { url: window.location.href }),
 				])
-			const onDocumentReady = () => armQuietWindow()
+			const onDocumentReady = () => armSettleWindow()
 			const onInputChange = (event: Event) => {
 				const target = event.target
 				if (!(target instanceof HTMLElement)) return
@@ -685,10 +742,17 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				)?.[0]
 				if (localId) recordSignals([signalEvent('target.valueChanged', { localId })])
 			}
-			const timeoutTimer = setTimeout(
-				() => finish({ status: 'timeout', signals, endedAt: now() }),
-				request.settle.maxWaitMs
-			)
+			const timeoutTimer = setTimeout(() => {
+				if (expectedObserved || request.expected.length === 0) {
+					finish({
+						status: expectedObserved ? 'satisfied' : 'stabilized',
+						signals,
+						endedAt: now(),
+					})
+					return
+				}
+				finish({ status: 'timeout', signals, endedAt: now() })
+			}, request.settle.maxWaitMs)
 
 			if (signal.aborted) {
 				onAbort()
@@ -708,7 +772,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 			document.addEventListener('DOMContentLoaded', onDocumentReady)
 			document.addEventListener('input', onInputChange, true)
 			document.addEventListener('change', onInputChange, true)
-			armQuietWindow()
+			armSettleWindow()
 		})
 	}
 

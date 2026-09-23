@@ -29,6 +29,7 @@ export type DomRpcRequest =
 			sessionId: string
 			actionId: string
 			expectedSessionRevision: number
+			tabId?: string
 			action: JsonObject
 	  }
 	| {

@@ -147,6 +147,10 @@ export interface TaskPlan {
 export interface TaskWorkItem {
 	workItemId: string
 	description: string
+	/** Observable semantic facts that must hold before this work item can finish. */
+	successCriteria?: string[]
+	/** Semantic work items compiled into this executable work item by the runtime. */
+	sourceWorkItemIds?: string[]
 	kind: 'navigate' | 'research' | 'interact'
 	required: boolean
 	dependsOn: string[]
@@ -185,9 +189,23 @@ export interface ActionJournalEntry {
 	workItemId?: string
 	action: string
 	label: string
+	selection?: ActionSelection
 	status: 'executed' | 'failed'
 	observationId: string
 	completedAt: string
+}
+
+/**
+ * A sanitized, durable description of an action selected from a page
+ * observation. It deliberately excludes generated input values and element
+ * references, both of which can be sensitive or stale on the next turn.
+ */
+export interface ActionSelection {
+	action: string
+	label: string
+	candidateSignature: string
+	observationSignature: string
+	page: { url: string; title: string }
 }
 
 export type TaskMode = 'conversation' | 'browser'

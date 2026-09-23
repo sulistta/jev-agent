@@ -1,5 +1,5 @@
 import type { ObservationRequest, SecretAwareString } from '@page-agent/browser'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { LocalBrowserRuntime } from './LocalBrowserRuntime'
 
@@ -94,6 +94,23 @@ describe('LocalBrowserRuntime', () => {
 		})
 	})
 
+	it('observes a generic pressed state for toggle controls', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = '<button aria-label="Like this video" aria-pressed="true"></button>'
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({
+			viewportExpansion: -1,
+			interactiveWhitelist: Array.from(document.querySelectorAll('button')),
+		})
+
+		const observation = await runtime.observe(request(), new AbortController().signal)
+
+		expect(observation.elements[0]).toMatchObject({
+			accessibleName: 'Like this video',
+			state: { pressed: true },
+		})
+	})
+
 	it('observes non-interactive content only when requested and honors region scope', async () => {
 		document
 			.querySelector('main')!
@@ -120,10 +137,12 @@ describe('LocalBrowserRuntime', () => {
 		expect(controlsOnly.content).toEqual([])
 	})
 
-	it('exposes navigation destinations without leaking query strings or fragments', async () => {
+	it('distinguishes navigation destinations without exposing query strings or fragments', async () => {
 		await runtime.dispose()
-		document.body.innerHTML =
-			'<a id="channel" href="https://www.youtube.com/@LucasMontano?token=secret#videos">Lucas Montano</a>'
+		document.body.innerHTML = `
+			<a id="first" href="https://example.test/watch?v=video-a&token=secret#details">First</a>
+			<a id="second" href="https://example.test/watch?v=video-b&token=secret#details">Second</a>
+		`
 		mockElementLayout()
 		runtime = new LocalBrowserRuntime({
 			viewportExpansion: -1,
@@ -132,7 +151,41 @@ describe('LocalBrowserRuntime', () => {
 
 		const observation = await runtime.observe(request(), new AbortController().signal)
 
-		expect(observation.elements[0].attributes.href).toBe('https://www.youtube.com/@LucasMontano')
+		expect(observation.elements.map((element) => element.attributes.href)).toEqual([
+			'https://example.test/watch',
+			'https://example.test/watch',
+		])
+		expect(observation.elements[0].attributes.hrefIdentity).not.toBe(
+			observation.elements[1].attributes.hrefIdentity
+		)
+		const serializedAttributes = JSON.stringify(
+			observation.elements.map((element) => element.attributes)
+		)
+		expect(serializedAttributes).not.toContain('token')
+		expect(serializedAttributes).not.toContain('video-a')
+	})
+
+	it('groups controls with their ordered collection items', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = `
+			<section aria-label="Videos">
+				<article><a id="first-video" href="/watch?v=one">First video</a><button>Menu</button></article>
+				<article><a id="second-video" href="/watch?v=two">Second video</a><button>Menu</button></article>
+			</section>
+		`
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({
+			viewportExpansion: -1,
+			interactiveWhitelist: Array.from(document.querySelectorAll('a, button')),
+		})
+
+		const observation = await runtime.observe(request(), new AbortController().signal)
+		const first = observation.elements.find((element) => element.attributes.id === 'first-video')
+		const second = observation.elements.find((element) => element.attributes.id === 'second-video')
+
+		expect(first?.collectionItem).toMatchObject({ position: 1, text: 'First videoMenu' })
+		expect(second?.collectionItem).toMatchObject({ position: 2, text: 'Second videoMenu' })
+		expect(first?.collectionItem?.collectionId).toBe(second?.collectionItem?.collectionId)
 	})
 
 	it('marks controls inside an open menu as modal context', async () => {
@@ -296,7 +349,37 @@ describe('LocalBrowserRuntime', () => {
 		await expect(waiting).resolves.toMatchObject({ status: 'timeout' })
 	})
 
-	it('waits for a quiet window and restarts it when the page changes again', async () => {
+	it('does not settle a new document before its load lifecycle completes', async () => {
+		let readyState: DocumentReadyState = 'interactive'
+		const readyStateSpy = vi
+			.spyOn(document, 'readyState', 'get')
+			.mockImplementation(() => readyState)
+		let settled = false
+		const waiting = runtime
+			.waitFor(
+				{
+					sessionId,
+					tabId: 'in-page',
+					since: new Date().toISOString(),
+					expected: [],
+					settle: { quietWindowMs: 10, maxWaitMs: 100 },
+				},
+				new AbortController().signal
+			)
+			.then((result) => {
+				settled = true
+				return result
+			})
+
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(settled).toBe(false)
+		readyState = 'complete'
+		window.dispatchEvent(new Event('load'))
+		await expect(waiting).resolves.toMatchObject({ status: 'stabilized' })
+		readyStateSpy.mockRestore()
+	})
+
+	it('uses a bounded settle window even when the page keeps mutating', async () => {
 		let settled = false
 		const waiting = runtime
 			.waitFor(
@@ -320,7 +403,7 @@ describe('LocalBrowserRuntime', () => {
 
 		document.body.append(document.createElement('footer'))
 		await new Promise((resolve) => setTimeout(resolve, 20))
-		expect(settled).toBe(false)
+		expect(settled).toBe(true)
 		await expect(waiting).resolves.toMatchObject({ status: 'satisfied' })
 	})
 

@@ -39,6 +39,7 @@ export class OpenAiCompatibleSemanticTextProvider implements SemanticTextProvide
 				z.object({
 					workItemId: z.string().min(1),
 					description: z.string().min(1),
+					successCriteria: z.array(z.string().min(1)).min(1).optional(),
 					kind: z.enum(['navigate', 'research', 'interact']),
 					required: z.boolean(),
 					dependsOn: z.array(z.string()),
@@ -60,7 +61,7 @@ export class OpenAiCompatibleSemanticTextProvider implements SemanticTextProvide
 		})
 		return this.invokeTyped(
 			'provide_task_plan',
-			'Create a structured browser task plan. List missing inputs only when no productive browser work can begin without them. Optional preferences, discoverable facts, and values that can use reasonable defaults are not missing inputs. Keep work items semantic; never choose DOM elements or browser operations.',
+			'Create a structured browser task plan. List missing inputs only when no productive browser work can begin without them. Optional preferences, discoverable facts, and values that can use reasonable defaults are not missing inputs. Keep work items semantic; never choose DOM elements or browser operations. Every non-research work item must end in an observable browser-state transition. Do not create a standalone work item that merely finds or identifies a target needed by a later interaction; combine discovery with navigating to or opening that target so its identity does not need to be carried as hidden state. Give every work item observable successCriteria. Use research only when the requested deliverable requires retaining, comparing, or reporting a source-backed set of facts. Discovering a page, entity, item, or UI target solely so it can be opened or acted on is navigation, never research.',
 			schema,
 			[
 				{
@@ -197,7 +198,7 @@ function messagesFor(input: Parameters<SemanticTextProvider['generate']>[0]): Me
 		field: input.field,
 		page: input.page,
 		reason: input.reason,
-		actions: input.actionHistory?.slice(-8),
+		actions: input.actionHistory,
 		plan: input.plan,
 		evidence: input.evidence?.filter((item) => item.verification === 'verified').slice(-100),
 	})

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { InvokeError, InvokeErrorTypes, LLM } from './index'
 import type { LLMClient } from './types'
@@ -23,9 +23,14 @@ describe('LLM.invoke retry behavior', () => {
 	const signal = new AbortController().signal
 
 	beforeEach(() => {
+		vi.useFakeTimers()
 		llm = makeLLM(2)
 		client = { invoke: vi.fn() }
 		llm.client = client as unknown as LLMClient
+	})
+
+	afterEach(() => {
+		vi.useRealTimers()
 	})
 
 	it('returns immediately on first success', async () => {
@@ -45,7 +50,10 @@ describe('LLM.invoke retry behavior', () => {
 			.mockRejectedValueOnce(retryable)
 			.mockRejectedValueOnce(retryable)
 
-		await expect(llm.invoke([], {}, signal)).rejects.toBe(retryable)
+		const invocation = llm.invoke([], {}, signal)
+		const rejection = expect(invocation).rejects.toBe(retryable)
+		await vi.runAllTimersAsync()
+		await rejection
 		// 1 initial + 2 retries = 3 attempts total
 		expect(client.invoke).toHaveBeenCalledTimes(3)
 	})
@@ -54,7 +62,9 @@ describe('LLM.invoke retry behavior', () => {
 		const retryable = new InvokeError(InvokeErrorTypes.RATE_LIMIT, 'slow down')
 		client.invoke.mockRejectedValueOnce(retryable).mockResolvedValueOnce('ok')
 
-		await expect(llm.invoke([], {}, signal)).resolves.toBe('ok')
+		const invocation = llm.invoke([], {}, signal)
+		await vi.runAllTimersAsync()
+		await expect(invocation).resolves.toBe('ok')
 		expect(client.invoke).toHaveBeenCalledTimes(2)
 	})
 
@@ -71,7 +81,9 @@ describe('LLM.invoke retry behavior', () => {
 			events.push((e as CustomEvent).detail)
 		})
 
-		await llm.invoke([], {}, signal)
+		const invocation = llm.invoke([], {}, signal)
+		await vi.runAllTimersAsync()
+		await invocation
 
 		expect(events).toEqual([
 			{ attempt: 1, maxAttempts: 2, lastError: err1 },
@@ -108,7 +120,37 @@ describe('LLM.invoke retry behavior', () => {
 		const plain = new TypeError('weird')
 		client.invoke.mockRejectedValueOnce(plain).mockResolvedValueOnce('ok')
 
-		await expect(llm.invoke([], {}, signal)).resolves.toBe('ok')
+		const invocation = llm.invoke([], {}, signal)
+		await vi.runAllTimersAsync()
+		await expect(invocation).resolves.toBe('ok')
 		expect(client.invoke).toHaveBeenCalledTimes(2)
+	})
+
+	it('uses provider Retry-After metadata instead of immediate retries', async () => {
+		const retryable = new InvokeError(InvokeErrorTypes.RATE_LIMIT, 'slow down')
+		retryable.retryAfterMs = 2_500
+		client.invoke.mockRejectedValueOnce(retryable).mockResolvedValueOnce('ok')
+
+		const invocation = llm.invoke([], {}, signal)
+		await vi.advanceTimersByTimeAsync(2_499)
+		expect(client.invoke).toHaveBeenCalledOnce()
+		await vi.advanceTimersByTimeAsync(1)
+		await expect(invocation).resolves.toBe('ok')
+		expect(client.invoke).toHaveBeenCalledTimes(2)
+	})
+
+	it('aborts while waiting to retry', async () => {
+		const controller = new AbortController()
+		const retryable = new InvokeError(InvokeErrorTypes.RATE_LIMIT, 'slow down')
+		retryable.retryAfterMs = 10_000
+		client.invoke.mockRejectedValueOnce(retryable)
+
+		const invocation = llm.invoke([], {}, controller.signal)
+		const rejection = expect(invocation).rejects.toMatchObject({ name: 'AbortError' })
+		await vi.advanceTimersByTimeAsync(0)
+		controller.abort()
+
+		await rejection
+		expect(client.invoke).toHaveBeenCalledOnce()
 	})
 })

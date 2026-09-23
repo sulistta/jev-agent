@@ -5,7 +5,7 @@ import type {
 	ReferenceValidation,
 	SynchronizationRequest,
 } from '@page-agent/browser'
-import { LocalBrowserRuntime } from '@page-agent/page-controller'
+import { LocalBrowserRuntime, SimulatorMask } from '@page-agent/page-controller'
 import type { ContentDocumentHello, DomRpcRequest, WireDomError } from '@page-agent/protocol'
 import { PROTOCOL_VERSION } from '@page-agent/protocol'
 
@@ -26,6 +26,7 @@ export function initProtocolDomEndpoint(): void {
 	const documentId = requestId('document')
 	let runtime: LocalBrowserRuntime | undefined
 	let runtimeTabId: string | undefined
+	let visualCursor: SimulatorMask | undefined
 	void chrome.runtime.sendMessage({
 		type: 'PAGE_AGENT_V2_CONTENT_HELLO',
 		payload: {
@@ -59,9 +60,20 @@ export function initProtocolDomEndpoint(): void {
 			runtimeTabId = tabId
 		}
 
+		const showCursor =
+			message.payload.type === 'dom.execute' &&
+			typeof message.payload.action.type === 'string' &&
+			['click', 'input', 'select', 'focus'].includes(message.payload.action.type)
+		if (showCursor) {
+			visualCursor ??= new SimulatorMask({ visualOnly: true })
+			visualCursor.show()
+		}
 		handleDomRequest(runtime, runtimeTabId!, message.payload)
 			.then((value) => sendResponse({ ok: true, value } satisfies DomRpcSuccess))
 			.catch((error: unknown) => sendResponse(toFailure(error)))
+			.finally(() => {
+				if (showCursor) visualCursor?.hide()
+			})
 		return true
 	})
 }
@@ -84,6 +96,7 @@ async function handleDomRequest(
 					sessionId: request.sessionId,
 					actionId: request.actionId,
 					expectedSessionRevision: request.expectedSessionRevision,
+					tabId,
 					action: request.action as unknown as BrowserAction,
 				} satisfies BrowserActionRequest,
 				new AbortController().signal
@@ -124,7 +137,7 @@ function domRequestTabId(request: DomRpcRequest): string | undefined {
 	if (request.type === 'dom.observe' || request.type === 'dom.wait') return request.tabId
 	if (request.type === 'dom.revalidate') return request.ref.tabId
 	const action = request.action as { target?: { tabId?: unknown } }
-	return typeof action.target?.tabId === 'string' ? action.target.tabId : undefined
+	return typeof action.target?.tabId === 'string' ? action.target.tabId : request.tabId
 }
 
 function isDomRequest(value: unknown): value is DomRpcRequest {

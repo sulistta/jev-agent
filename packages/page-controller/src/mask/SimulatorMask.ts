@@ -20,7 +20,7 @@ export class SimulatorMask extends EventTarget {
 	#targetCursorX = 0
 	#targetCursorY = 0
 
-	constructor() {
+	constructor(options: { visualOnly?: boolean } = {}) {
 		super()
 
 		this.wrapper.id = 'page-agent-runtime_simulator-mask'
@@ -28,17 +28,20 @@ export class SimulatorMask extends EventTarget {
 		this.wrapper.setAttribute('data-browser-use-ignore', 'true')
 		this.wrapper.setAttribute('data-page-agent-ignore', 'true')
 
-		try {
-			const motion = new Motion({
-				mode: isPageDark() ? 'dark' : 'light',
-				styles: { position: 'absolute', inset: '0' },
-			})
-			this.motion = motion
-			this.wrapper.appendChild(motion.element)
-			motion.autoResize(this.wrapper)
-		} catch (e) {
-			console.warn('[SimulatorMask] Motion overlay unavailable:', e)
+		if (!options.visualOnly) {
+			try {
+				const motion = new Motion({
+					mode: isPageDark() ? 'dark' : 'light',
+					styles: { position: 'absolute', inset: '0' },
+				})
+				this.motion = motion
+				this.wrapper.appendChild(motion.element)
+				motion.autoResize(this.wrapper)
+			} catch (e) {
+				console.warn('[SimulatorMask] Motion overlay unavailable:', e)
+			}
 		}
+		if (options.visualOnly) this.wrapper.style.pointerEvents = 'none'
 
 		// Capture all mouse, keyboard, and wheel events
 		this.wrapper.addEventListener('click', (e) => {
@@ -76,8 +79,6 @@ export class SimulatorMask extends EventTarget {
 
 		document.body.appendChild(this.wrapper)
 
-		this.#moveCursorToTarget()
-
 		// global events
 		// @note Mask should be isolated from the rest of the code.
 		// Global events are easier to manage and cleanup.
@@ -93,7 +94,7 @@ export class SimulatorMask extends EventTarget {
 			this.wrapper.style.pointerEvents = 'none'
 		}
 		const disablePassThroughListener = () => {
-			this.wrapper.style.pointerEvents = 'auto'
+			if (!options.visualOnly) this.wrapper.style.pointerEvents = 'auto'
 		}
 
 		window.addEventListener('PageAgent::MovePointerTo', movePointerToListener)
@@ -131,7 +132,7 @@ export class SimulatorMask extends EventTarget {
 	}
 
 	#moveCursorToTarget() {
-		if (this.#disposed) return
+		if (this.#disposed || !this.shown) return
 
 		const newX = this.#currentCursorX + (this.#targetCursorX - this.#currentCursorX) * 0.2
 		const newY = this.#currentCursorY + (this.#targetCursorY - this.#currentCursorY) * 0.2
@@ -191,6 +192,7 @@ export class SimulatorMask extends EventTarget {
 		this.#targetCursorY = this.#currentCursorY
 		this.#cursor.style.left = `${this.#currentCursorX}px`
 		this.#cursor.style.top = `${this.#currentCursorY}px`
+		this.#moveCursorToTarget()
 	}
 
 	hide() {
@@ -203,7 +205,7 @@ export class SimulatorMask extends EventTarget {
 		this.#cursor.classList.remove(cursorStyles.clicking)
 
 		setTimeout(() => {
-			this.wrapper.classList.remove(styles.visible)
+			if (!this.shown) this.wrapper.classList.remove(styles.visible)
 		}, 800) // Match the animation duration
 	}
 

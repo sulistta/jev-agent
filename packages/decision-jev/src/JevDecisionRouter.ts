@@ -29,7 +29,6 @@ interface ConcreteCandidate {
 }
 
 interface RecentSelection {
-	goalId: string
 	action: string
 	label: string
 	candidateSignature: string
@@ -41,7 +40,6 @@ interface RecentSelection {
 export class JevDecisionRouter implements DecisionRouter {
 	private readonly provider: JevDecisionProvider
 	private readonly semanticText: SemanticTextProvider
-	private readonly recentSelections = new Map<string, RecentSelection[]>()
 	private sequence = 0
 
 	constructor(
@@ -62,19 +60,22 @@ export class JevDecisionRouter implements DecisionRouter {
 		signal: AbortSignal
 	): Promise<DecisionResult> {
 		if (signal.aborted) return { kind: 'failed', reason: 'CANCELLED' }
-		const history = this.historyFor(input.session.sessionId, input.goal.goalId)
+		const history = this.historyFor(input.session, input.goal.goalId)
 		const allCandidates = concreteCandidates(input)
-		const attempted = new Set(history.map((item) => item.candidateSignature))
+		const observationHash = observationStateHash(input.observation)
+		const attempted = new Set(
+			history
+				.filter((item) => item.fromObservationHash === observationHash)
+				.map((item) => item.candidateSignature)
+		)
 		const candidates = allCandidates.filter(
-			(candidate) => !attempted.has(attemptSignature(candidate, input.observation))
+			(candidate) => !attempted.has(candidateSignature(candidate))
 		)
 		const fingerprint = decisionFingerprint(input, candidates)
 		const state = decisionState(
 			input,
 			candidates,
-			allCandidates.filter((candidate) =>
-				attempted.has(attemptSignature(candidate, input.observation))
-			),
+			allCandidates.filter((candidate) => attempted.has(candidateSignature(candidate))),
 			history
 		)
 		const judgeCompletion = shouldOfferCompletion(history, input.observation)
@@ -116,7 +117,7 @@ export class JevDecisionRouter implements DecisionRouter {
 				reason:
 					allCandidates.length === 0
 						? 'No structurally valid action or unexplored viewport area is available for the current goal.'
-						: 'Every concrete action in the current goal has already been attempted; refusing to repeat an action cycle.',
+						: 'Every concrete action in this page state has already been executed; refusing to repeat an action cycle.',
 				fingerprint,
 			}
 		}
@@ -150,7 +151,22 @@ export class JevDecisionRouter implements DecisionRouter {
 				fingerprint,
 			}
 
-		return this.toDecision(input, selected.candidate, history, fingerprint, signal)
+		const candidate = selected.candidate
+		const decision = await this.toDecision(input, candidate, history, fingerprint, signal)
+		if (decision.kind !== 'action') return decision
+		return {
+			...decision,
+			selection: {
+				action: candidate.action,
+				label: candidate.label,
+				candidateSignature: candidateSignature(candidate),
+				observationSignature: observationStateHash(input.observation),
+				page: {
+					url: input.observation.page.url,
+					title: input.observation.page.title,
+				},
+			},
+		}
 	}
 
 	private async selectWithChoice(
@@ -274,7 +290,6 @@ export class JevDecisionRouter implements DecisionRouter {
 				signal
 			)
 			const url = validateHttpUrl(generated.url)
-			this.remember(input, candidate, url)
 			return {
 				kind: 'action',
 				action: { type: 'tab.open', url },
@@ -286,7 +301,6 @@ export class JevDecisionRouter implements DecisionRouter {
 			const amount = numberArg(candidate, 'amount')
 			if (amount === undefined)
 				return { kind: 'failed', reason: 'Jev selected an invalid scroll candidate', fingerprint }
-			this.remember(input, candidate, candidate.label)
 			return {
 				kind: 'action',
 				action: { type: 'scroll', axis: 'y', amount: { kind: 'pages', value: amount } },
@@ -313,7 +327,6 @@ export class JevDecisionRouter implements DecisionRouter {
 				signal
 			)
 			const text = validateInputText(generated.text)
-			this.remember(input, candidate, candidate.label)
 			return {
 				kind: 'action',
 				action: {
@@ -330,7 +343,6 @@ export class JevDecisionRouter implements DecisionRouter {
 			const value = stringArg(candidate, 'optionValue')
 			if (value === undefined)
 				return { kind: 'failed', reason: 'Jev selected an invalid select option', fingerprint }
-			this.remember(input, candidate, candidate.label)
 			return {
 				kind: 'action',
 				action: {
@@ -342,7 +354,6 @@ export class JevDecisionRouter implements DecisionRouter {
 				fingerprint,
 			}
 		}
-		this.remember(input, candidate, candidate.label)
 		return {
 			kind: 'action',
 			action: { type: 'click', target: candidate.target },
@@ -356,33 +367,27 @@ export class JevDecisionRouter implements DecisionRouter {
 		return `jev:${observation.observationId}:${this.sequence}`
 	}
 
-	private historyFor(sessionId: string, goalId: string): RecentSelection[] {
-		return (this.recentSelections.get(sessionId) ?? []).filter((item) => item.goalId === goalId)
-	}
-
-	private remember(
-		input: { session: Session; goal: GoalContract; observation: PageObservation },
-		candidate: ConcreteCandidate,
-		label: string
-	): void {
-		const history = this.historyFor(input.session.sessionId, input.goal.goalId)
-		history.push({
-			goalId: input.goal.goalId,
-			action: candidate.action,
-			label: truncate(label, maxLabelChars),
-			candidateSignature: attemptSignature(candidate, input.observation),
-			fromUrl: truncate(input.observation.page.url, 512),
-			fromTitle: truncate(input.observation.page.title, 512),
-			fromObservationHash: observationStateHash(input.observation),
+	private historyFor(session: Session, goalId: string): RecentSelection[] {
+		return (session.actionJournal ?? []).flatMap((entry) => {
+			const selection = entry.selection
+			if (entry.workItemId !== goalId || !selection) return []
+			return [
+				{
+					action: selection.action,
+					label: truncate(selection.label, maxLabelChars),
+					candidateSignature: selection.candidateSignature,
+					fromUrl: truncate(selection.page.url, 512),
+					fromTitle: truncate(selection.page.title, 512),
+					fromObservationHash: selection.observationSignature,
+				},
+			]
 		})
-		this.recentSelections.set(input.session.sessionId, history)
 	}
 
 	private goalSatisfied(
 		input: { session: Session; observation: PageObservation },
 		fingerprint: string
 	): DecisionResult {
-		this.recentSelections.delete(input.session.sessionId)
 		return {
 			kind: 'goal_satisfied',
 			reason: 'Jev verified the complete goal from the current page and recent actions',
@@ -503,6 +508,10 @@ function elementCandidate(
 		args.y = Math.round(element.bounds.y)
 	}
 	if (optionValue !== undefined) args.optionValue = optionValue
+	if (element.collectionItem) {
+		args.collectionPosition = element.collectionItem.position
+		args.collectionText = truncate(element.collectionItem.text, maxLabelChars)
+	}
 	const baseLabel =
 		[
 			...new Set(
@@ -528,7 +537,11 @@ function elementCandidate(
 		label:
 			action === 'select'
 				? `select ${optionLabel || '(empty option)'} in ${baseLabel}`
-				: `${action} ${baseLabel}`,
+				: `${action} ${element.collectionItem ? `collection item ${element.collectionItem.position}: ` : ''}${baseLabel}${
+						element.collectionItem?.text && !element.collectionItem.text.includes(baseLabel)
+							? ` — ${truncate(element.collectionItem.text, maxLabelChars)}`
+							: ''
+					}`,
 		args,
 	}
 }
@@ -640,10 +653,6 @@ function candidateSignature(candidate: ConcreteCandidate): string {
 			args: candidate.args,
 		})
 	)
-}
-
-function attemptSignature(candidate: ConcreteCandidate, observation: PageObservation): string {
-	return shortHash(`${observationStateHash(observation)}\n${candidateSignature(candidate)}`)
 }
 
 function decisionFingerprint(

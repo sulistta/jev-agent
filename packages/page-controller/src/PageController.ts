@@ -434,3 +434,4 @@ export class PageController extends EventTarget {
 
 export * from './actions'
 export { LocalBrowserRuntime } from './LocalBrowserRuntime'
+export { SimulatorMask } from './mask/SimulatorMask'
