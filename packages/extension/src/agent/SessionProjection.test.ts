@@ -28,7 +28,7 @@ describe('SessionProjection', () => {
 			event('session.status_changed', { status: 'waiting_user' })
 		)
 		expect(history).toMatchObject([
-			{ content: expect.stringContaining('A value is required before input') },
+			{ type: 'decision', kind: 'clarify' },
 			{ content: expect.stringContaining('Waiting for user input') },
 		])
 	})
@@ -39,10 +39,47 @@ describe('SessionProjection', () => {
 			event('decision.selected', {
 				kind: 'action',
 				candidateLabel: 'click Like this video',
+				selectedOptionId: 'button-2',
+				candidateCount: '2',
+				choices: JSON.stringify([
+					{ id: 'button-1', label: 'click Subscribe' },
+					{ id: 'button-2', label: 'click Like this video' },
+				]),
 			})
 		)
 		expect(history).toMatchObject([
-			{ content: expect.stringContaining('Selected: click Like this video') },
+			{
+				type: 'decision',
+				selectedLabel: 'click Like this video',
+				selectedOptionId: 'button-2',
+				candidateCount: 2,
+				choices: expect.any(Array),
+			},
+		])
+	})
+
+	it('does not show a repeated technical decision error before the final error card', () => {
+		const history = projectSessionEvent(
+			[],
+			event('decision.selected', {
+				kind: 'failed',
+				reason: 'Jev HTTP 400',
+				candidateCount: '1',
+				choices: JSON.stringify([{ id: 'button-1', label: 'click Like' }]),
+			})
+		)
+		expect(
+			projectSessionEvent(history, event('session.failed', { reason: 'Jev HTTP 400' }))
+		).toEqual([
+			{
+				type: 'decision',
+				kind: 'failed',
+				selectedLabel: undefined,
+				selectedOptionId: undefined,
+				candidateCount: 1,
+				choices: [{ id: 'button-1', label: 'click Like' }],
+			},
+			{ type: 'error', message: 'Jev HTTP 400' },
 		])
 	})
 

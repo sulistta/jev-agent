@@ -225,6 +225,15 @@ export interface ObservationEvent {
 	content: string
 }
 
+export interface DecisionEvent {
+	type: 'decision'
+	kind: string
+	selectedLabel?: string
+	selectedOptionId?: string
+	candidateCount: number
+	choices: { id: string; label: string }[]
+}
+
 /**
  * User takeover event
  */
@@ -264,6 +273,7 @@ export interface AssistantMessageEvent {
 export type HistoricalEvent =
 	| AgentStepEvent
 	| ObservationEvent
+	| DecisionEvent
 	| UserTakeoverEvent
 	| RetryEvent
 	| AgentErrorEvent

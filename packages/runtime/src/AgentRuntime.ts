@@ -373,6 +373,7 @@ class SessionExecution implements SessionHandle {
 					selectedProbability: String(decision.diagnostics?.selectedProbability ?? ''),
 					confidence: String(decision.diagnostics?.confidence ?? ''),
 					selectedTransition: decision.diagnostics?.selectedTransition ?? '',
+					choices: JSON.stringify(decision.diagnostics?.choices ?? []),
 				})
 
 				if (decision.kind === 'goal_satisfied') {
@@ -565,8 +566,7 @@ class SessionExecution implements SessionHandle {
 					...session,
 					actionJournal: [...(session.actionJournal ?? []), journalEntry],
 					decisionFingerprints:
-						decision.fingerprint &&
-						!session.decisionFingerprints?.includes(decision.fingerprint)
+						decision.fingerprint && !session.decisionFingerprints?.includes(decision.fingerprint)
 							? [...(session.decisionFingerprints ?? []), decision.fingerprint]
 							: (session.decisionFingerprints ?? []),
 				})

@@ -11,7 +11,7 @@ import {
 } from './JevDecisionRouter'
 import { SeedThresholdPolicy } from './gates'
 import { MockJevTransport } from './transports'
-import type { JevRequest } from './types'
+import { type JevRequest, JevTransportError } from './types'
 
 const observation: PageObservation = {
 	observationId: 'observation-1',
@@ -181,25 +181,51 @@ describe('JevDecisionRouter', () => {
 		expect(transport.requests).toHaveLength(1)
 	})
 
-	it('uses parallel Noul judgments in one request above 254 actions', async () => {
+	it('recovers from a Choice context overflow by evaluating every candidate in smaller Noul batches', async () => {
+		const elements = Array.from({ length: 200 }, (_, index) => element(index, `Control ${index}`))
+		const transport = new MockJevTransport((request) => {
+			if (request.questions[0].primitive === 'choice')
+				throw new JevTransportError('CONTEXT_LIMIT', 'max_tokens_exceeded', false)
+			if (request.questions.length > 8)
+				throw new JevTransportError('CONTEXT_LIMIT', 'max_tokens_exceeded', false)
+			return {
+				requestId: request.requestId,
+				answers: request.questions.map((question) => ({
+					questionId: question.questionId,
+					value: question.questionId === 'candidate:199' ? 0.99 : 0.1,
+				})),
+			}
+		})
+		const result = await new JevDecisionRouter(provider(transport)).decide(
+			{ session, goal, observation: { ...observation, elements }, need },
+			new AbortController().signal
+		)
+		expect(result).toMatchObject({ kind: 'action', action: { target: { localId: 'index:199' } } })
+		const evaluated = transport.requests.flatMap((request) =>
+			request.questions.length <= 8 && request.questions[0].primitive === 'noul'
+				? request.questions.map((question) => question.questionId)
+				: []
+		)
+		expect(evaluated).toEqual(Array.from({ length: 200 }, (_, index) => `candidate:${index}`))
+	})
+
+	it('evaluates every Noul candidate without duplicating the option list in state', async () => {
 		const elements = Array.from({ length: 274 }, (_, index) =>
 			element(index, index === 273 ? 'Gostei' : `Control ${index}`)
 		)
 		const transport = new MockJevTransport((request) => {
 			expect(request.questions).toHaveLength(274)
 			expect(request.questions.every((question) => question.primitive === 'noul')).toBe(true)
-			expect(request.questions[273].state).toMatchObject({
+			expect(request.questions[0].state).toMatchObject({
 				originalRequest: 'save the form',
 				currentGoal: 'Like the second oldest video',
-				candidates: expect.arrayContaining([
-					expect.objectContaining({ index: 273, label: 'click Gostei' }),
-				]),
 			})
+			expect(request.questions[0].state).not.toHaveProperty('candidates')
 			return {
 				requestId: request.requestId,
-				answers: request.questions.map((question, index) => ({
+				answers: request.questions.map((question) => ({
 					questionId: question.questionId,
-					value: index === 273 ? 0.98 : 0.1,
+					value: question.questionId === 'candidate:273' ? 0.98 : 0.1,
 					confidence: 0.9,
 				})),
 			}
@@ -217,6 +243,7 @@ describe('JevDecisionRouter', () => {
 			kind: 'action',
 			action: { type: 'click', target: { localId: 'index:273' } },
 		})
+		expect(transport.requests.flatMap((request) => request.questions)).toHaveLength(274)
 		expect(transport.requests).toHaveLength(1)
 	})
 
@@ -286,7 +313,9 @@ describe('JevDecisionRouter', () => {
 		const publish = element(1, 'Publish')
 		const selectedId = 'observation-2:jev:click:index:1'
 		const transport = new MockJevTransport((request) => {
-			const options = request.questions.find((question) => question.questionId === 'action')?.options
+			const options = request.questions.find(
+				(question) => question.questionId === 'action'
+			)?.options
 			expect(options?.map((option) => option.id)).toEqual([
 				'observation-2:jev:click:index:0',
 				selectedId,
@@ -324,18 +353,18 @@ describe('JevDecisionRouter', () => {
 			],
 		}
 		const decision = await new JevDecisionRouter(provider(transport)).decide(
-				{
-					session: filledSession,
-					goal,
-					observation: {
-						...observation,
-						observationId: 'observation-2',
-						elements: [editor, publish],
-					},
-					need,
+			{
+				session: filledSession,
+				goal,
+				observation: {
+					...observation,
+					observationId: 'observation-2',
+					elements: [editor, publish],
 				},
-				new AbortController().signal
-			)
+				need,
+			},
+			new AbortController().signal
+		)
 		expect(decision.kind, decision.reason).toBe('action')
 		expect(decision).toMatchObject({ action: { type: 'click', target: publish.ref } })
 	})
@@ -591,9 +620,9 @@ describe('JevDecisionRouter', () => {
 		const router = new JevDecisionRouter(provider(transport))
 		const cycleElements = [element(0, 'Toggle menu'), element(1, 'Continue')]
 		const first = await router.decide(
-				{ session, goal, observation: { ...observation, elements: cycleElements }, need },
-				new AbortController().signal
-			)
+			{ session, goal, observation: { ...observation, elements: cycleElements }, need },
+			new AbortController().signal
+		)
 		expect(first).toMatchObject({ candidateId: firstId })
 		const afterFirst = withExecutedAction(session, first)
 		const changedObservation = {
@@ -603,14 +632,14 @@ describe('JevDecisionRouter', () => {
 			elements: cycleElements,
 		}
 		const second = await router.decide(
-				{
-					session: afterFirst,
-					goal,
-					observation: changedObservation,
-					need,
-				},
-				new AbortController().signal
-			)
+			{
+				session: afterFirst,
+				goal,
+				observation: changedObservation,
+				need,
+			},
+			new AbortController().signal
+		)
 		expect(second).toMatchObject({ kind: 'action', candidateId: changedStateId })
 		await expect(
 			router.decide(
@@ -652,7 +681,10 @@ describe('JevDecisionRouter', () => {
 			return choiceResponse(request, selectedId)
 		})
 		const router = new JevDecisionRouter(provider(transport))
-		const first = await router.decide({ session, goal, observation, need }, new AbortController().signal)
+		const first = await router.decide(
+			{ session, goal, observation, need },
+			new AbortController().signal
+		)
 		expect(first).toMatchObject({ kind: 'action' })
 		await expect(
 			router.decide(

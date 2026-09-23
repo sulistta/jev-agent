@@ -3,12 +3,14 @@ import type {
 	AgentErrorEvent,
 	AgentStepEvent,
 	AssistantMessageEvent,
+	DecisionEvent,
 	HistoricalEvent,
 	ObservationEvent,
 	RetryEvent,
 } from '@page-agent/core'
 import {
 	CheckCircle,
+	ChevronRight,
 	Eye,
 	Globe,
 	Keyboard,
@@ -221,10 +223,11 @@ function RawSection({ rawRequest, rawResponse }: { rawRequest?: unknown; rawResp
 }
 
 function StepCard({ event }: { event: AgentStepEvent }) {
+	const input = event.action?.input as { candidateLabel?: string } | undefined
 	return (
 		<div className="rounded-lg border-l-2 border-l-blue-500/50 border bg-muted/40 p-2.5">
 			<div className="text-[11px] font-semibold text-foreground tracking-wide mb-2">
-				Step #{event.stepIndex! + 1}
+				Action #{event.stepIndex! + 1}
 			</div>
 
 			{/* Reflection */}
@@ -244,10 +247,8 @@ function StepCard({ event }: { event: AgentStepEvent }) {
 						<div className="flex-1 min-w-0">
 							<p className="text-xs text-foreground/80 mb-0.5 wrap-anywhere break-all line-clamp-1 hover:line-clamp-none">
 								<span className="font-medium text-foreground/70">{event.action.name}</span>
-								{event.action.name !== 'done' && (
-									<span className="text-muted-foreground/70 ml-1.5">
-										{JSON.stringify(event.action.input)}
-									</span>
+								{event.action.name !== 'done' && input?.candidateLabel && (
+									<span className="text-muted-foreground/70 ml-1.5">{input.candidateLabel}</span>
 								)}
 							</p>
 							<p className="text-[11px] text-muted-foreground/70 grid grid-cols-[auto_1fr] gap-1.5">
@@ -263,6 +264,59 @@ function StepCard({ event }: { event: AgentStepEvent }) {
 
 			{/* Raw Response */}
 			<RawSection rawRequest={event.rawRequest} rawResponse={event.rawResponse} />
+		</div>
+	)
+}
+
+function DecisionCard({ event }: { event: DecisionEvent }) {
+	const selected = event.choices.find((choice) => choice.id === event.selectedOptionId)
+	const outcome =
+		event.kind === 'goal_satisfied'
+			? 'Goal complete'
+			: event.kind === 'action'
+				? 'Next action'
+				: event.kind === 'failed'
+					? 'Decision unavailable'
+					: event.kind === 'blocked'
+						? 'No valid action'
+						: event.kind
+	return (
+		<div className="rounded-lg border bg-muted/30 px-2.5 py-2 text-xs">
+			<div className="flex items-start gap-2">
+				<Sparkles className="size-3.5 shrink-0 mt-0.5 text-violet-500" />
+				<div className="min-w-0 flex-1">
+					<div className="font-medium text-foreground">{outcome}</div>
+					<div className="text-muted-foreground mt-0.5 break-words">
+						{event.selectedLabel ||
+							selected?.label ||
+							(event.kind === 'goal_satisfied'
+								? 'The current goal was verified.'
+								: 'No browser action selected.')}
+					</div>
+				</div>
+			</div>
+			{event.choices.length > 0 && (
+				<details className="mt-2 border-t pt-1.5 group">
+					<summary className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground list-none">
+						<ChevronRight className="size-3 transition-transform group-open:rotate-90" />
+						Choices considered ({event.candidateCount})
+					</summary>
+					<ol className="mt-2 max-h-52 overflow-y-auto space-y-1 pl-4 list-decimal text-[11px] text-muted-foreground">
+						{event.choices.map((choice) => (
+							<li
+								key={choice.id}
+								className={cn(
+									'break-words',
+									choice.id === event.selectedOptionId && 'text-foreground font-medium'
+								)}
+							>
+								{choice.label}
+								{choice.id === event.selectedOptionId ? ' ✓' : ''}
+							</li>
+						))}
+					</ol>
+				</details>
+			)}
 		</div>
 	)
 }
@@ -323,6 +377,7 @@ function AssistantMessageCard({ event }: { event: AssistantMessageEvent }) {
 
 // History event card component
 export function EventCard({ event }: { event: HistoricalEvent }) {
+	if (event.type === 'decision') return <DecisionCard event={event} />
 	// Done action - show as result card
 	if (event.type === 'step' && event.action?.name === 'done') {
 		const input = event.action.input as { text?: string; success?: boolean }

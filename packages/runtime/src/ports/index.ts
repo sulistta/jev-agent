@@ -2,11 +2,11 @@ import type { BrowserAction, BrowserRuntime, PageObservation } from '@page-agent
 import type { JsonValue } from '@page-agent/protocol'
 
 import type {
+	ActionSelection,
 	ConversationMessage,
 	DecisionNeed,
 	Evidence,
 	EvidenceItem,
-	ActionSelection,
 	GoalContract,
 	Session,
 	TaskContract,
@@ -46,13 +46,7 @@ export interface SessionStore {
 }
 
 export interface DecisionResult {
-	kind:
-		| 'action'
-		| 'clarify'
-		| 'confirm'
-		| 'goal_satisfied'
-		| 'blocked'
-		| 'failed'
+	kind: 'action' | 'clarify' | 'confirm' | 'goal_satisfied' | 'blocked' | 'failed'
 	candidateId?: string
 	selection?: ActionSelection
 	action?: BrowserAction
@@ -66,6 +60,7 @@ export interface DecisionResult {
 export interface DecisionDiagnostics {
 	primitive: 'choice' | 'noul'
 	candidateCount: number
+	choices?: { id: string; label: string }[]
 	operation?: string
 	targetStrategy?: 'choice' | 'noul' | 'none'
 	requestCount?: number

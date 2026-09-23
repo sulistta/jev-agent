@@ -36,7 +36,14 @@ export interface PanelAgentAdapter extends EventTarget {
 
 	/** History of agent events */
 	readonly history: readonly {
-		type: 'step' | 'observation' | 'user_takeover' | 'retry' | 'error' | 'assistant_message'
+		type:
+			| 'step'
+			| 'observation'
+			| 'user_takeover'
+			| 'retry'
+			| 'error'
+			| 'assistant_message'
+			| 'decision'
 		stepIndex?: number
 		/** For 'step' type */
 		reflection?: {

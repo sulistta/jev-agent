@@ -14,6 +14,19 @@ const request: JevRequest = {
 afterEach(() => vi.useRealTimers())
 
 describe('Jev request lifetime', () => {
+	it('classifies provider context overflow separately from other invalid requests', async () => {
+		const transport = new DirectHttpJevTransport({
+			endpoint: 'https://api.typesafe.ai/v1/',
+			fetchImpl: async () =>
+				new Response(JSON.stringify({ detail: { error_type: 'max_tokens_exceeded' } }), {
+					status: 400,
+				}),
+		})
+		await expect(transport.systemOne(request, new AbortController().signal)).rejects.toMatchObject({
+			code: 'CONTEXT_LIMIT',
+			retryable: false,
+		})
+	})
 	it('bounds a fetch that never resolves, even if it ignores abort', async () => {
 		vi.useFakeTimers()
 		const transport = new DirectHttpJevTransport({

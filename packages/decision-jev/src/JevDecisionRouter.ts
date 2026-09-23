@@ -10,6 +10,7 @@ import type {
 
 import { JevDecisionProvider } from './JevDecisionProvider'
 import { jsonStateBytes } from './transports'
+import { JevTransportError } from './types'
 import type { JevDecisionResult, JevOption } from './types'
 
 const elementActions = ['click', 'input', 'select'] as const
@@ -75,10 +76,18 @@ export class JevDecisionRouter implements DecisionRouter {
 		const fingerprint = decisionFingerprint(input, candidates)
 		const state = decisionState(
 			input,
-			candidates,
 			allCandidates.filter((candidate) => attempted.has(candidateSignature(candidate))),
 			history
 		)
+		const choices = candidates.map((candidate) => ({
+			id: candidate.candidateId,
+			label: candidateOption(candidate).label,
+		}))
+		const diagnostics = {
+			primitive: (candidates.length <= choiceOptionLimit ? 'choice' : 'noul') as 'choice' | 'noul',
+			candidateCount: candidates.length,
+			choices,
+		}
 		const judgeCompletion = shouldOfferCompletion(history, input.observation)
 		if (input.session.decisionFingerprints?.includes(fingerprint))
 			return {
@@ -86,6 +95,7 @@ export class JevDecisionRouter implements DecisionRouter {
 				reason:
 					'The complete candidate set and browser state are unchanged; repeating the same judgment cannot make progress.',
 				fingerprint,
+				diagnostics,
 			}
 		if (candidates.length === 0) {
 			if (judgeCompletion) {
@@ -103,6 +113,7 @@ export class JevDecisionRouter implements DecisionRouter {
 							kind: 'failed',
 							reason: completion.reason ?? 'Invalid Jev completion judgment',
 							fingerprint,
+							diagnostics,
 						}
 					if (completionProbability(completion) > 0.5) return this.goalSatisfied(input, fingerprint)
 				} catch (error) {
@@ -110,6 +121,7 @@ export class JevDecisionRouter implements DecisionRouter {
 						kind: 'failed',
 						reason: `${error instanceof Error ? error.message : 'Jev request failed'} (complete candidate count: ${allCandidates.length}; state: ${jsonStateBytes(state)} bytes; no candidates were truncated)`,
 						fingerprint,
+						diagnostics,
 					}
 				}
 			}
@@ -120,6 +132,7 @@ export class JevDecisionRouter implements DecisionRouter {
 						? 'No structurally valid action or unexplored viewport area is available for the current goal.'
 						: 'Every concrete action in this page state has already been executed; refusing to repeat an action cycle.',
 				fingerprint,
+				diagnostics,
 			}
 		}
 
@@ -139,9 +152,14 @@ export class JevDecisionRouter implements DecisionRouter {
 				kind: 'failed',
 				reason: `${error instanceof Error ? error.message : 'Jev request failed'} (complete candidate count: ${candidates.length}; state: ${jsonStateBytes(state)} bytes; no candidates were truncated)`,
 				fingerprint,
+				diagnostics,
 			}
 		}
-		if (selected.goalSatisfied) return this.goalSatisfied(input, fingerprint)
+		if (selected.goalSatisfied)
+			return {
+				...this.goalSatisfied(input, fingerprint),
+				diagnostics: { ...diagnostics, selectedTransition: 'complete' },
+			}
 
 		if (!selected.candidate)
 			return {
@@ -150,6 +168,7 @@ export class JevDecisionRouter implements DecisionRouter {
 					selected.reason ??
 					`Jev evaluated all ${candidates.length} concrete candidates and found no suitable next action.`,
 				fingerprint,
+				diagnostics: { ...diagnostics, selectedTransition: 'none' },
 			}
 
 		const candidate = selected.candidate
@@ -157,6 +176,11 @@ export class JevDecisionRouter implements DecisionRouter {
 		if (decision.kind !== 'action') return decision
 		return {
 			...decision,
+			diagnostics: {
+				...diagnostics,
+				selectedTransition: 'action',
+				selectedOptionId: candidate.candidateId,
+			},
 			selection: {
 				action: candidate.action,
 				label: candidate.label,
@@ -188,25 +212,31 @@ export class JevDecisionRouter implements DecisionRouter {
 		reason?: string
 		failed?: boolean
 	}> {
-		const results = await this.provider.decideMany(
-			{
-				requestId: this.nextRequestId(input.observation),
-				state,
-				judgments: [
-					{
-						questionId: 'action',
-						need: input.need.kind,
-						risk: input.need.risk,
-						prompt:
-							'Which concrete candidate is the best immediate next step toward the current goal?',
-						options: candidates.map(candidateOption),
-						allowNone: true,
-					},
-					...(judgeCompletion ? [completionJudgment(input.need)] : []),
-				],
-			},
-			signal
-		)
+		let results: Record<string, JevDecisionResult>
+		try {
+			results = await this.provider.decideMany(
+				{
+					requestId: this.nextRequestId(input.observation),
+					state,
+					judgments: [
+						{
+							questionId: 'action',
+							need: input.need.kind,
+							risk: input.need.risk,
+							prompt:
+								'Which concrete candidate is the best immediate next step toward the current goal?',
+							options: candidates.map(candidateOption),
+							allowNone: true,
+						},
+						...(judgeCompletion ? [completionJudgment(input.need)] : []),
+					],
+				},
+				signal
+			)
+		} catch (error) {
+			if (!isContextLimit(error)) throw error
+			return this.selectWithNoul(input, candidates, state, judgeCompletion, signal)
+		}
 		const completion = results.completion
 		if (completion?.status === 'invalid')
 			return { failed: true, reason: completion.reason ?? 'Invalid Jev completion judgment' }
@@ -223,7 +253,7 @@ export class JevDecisionRouter implements DecisionRouter {
 			candidate,
 			reason:
 				result.status === 'none'
-					? result.reason ?? 'Jev found no suitable action in the current page state'
+					? (result.reason ?? 'Jev found no suitable action in the current page state')
 					: result.reason,
 		}
 	}
@@ -240,39 +270,56 @@ export class JevDecisionRouter implements DecisionRouter {
 		reason?: string
 		failed?: boolean
 	}> {
-		const results = await this.provider.decideMany(
-			{
-				requestId: this.nextRequestId(input.observation),
-				state,
-				judgments: [
-					...candidates.map((_, index) => ({
-						questionId: `candidate:${index}`,
-						primitive: 'noul' as const,
-						need: input.need.kind,
-						risk: input.need.risk,
-						prompt: `Is candidate ${index} an appropriate immediate next action toward the current goal?`,
-					})),
-					...(judgeCompletion ? [completionJudgment(input.need)] : []),
-				],
-			},
-			signal
-		)
-		const completion = results.completion
-		if (completion?.status === 'invalid')
-			return { failed: true, reason: completion.reason ?? 'Invalid Jev completion judgment' }
-		if (completionProbability(completion) > 0.5) return { goalSatisfied: true }
 		let bestIndex = -1
 		let bestProbability = 0.5
-		for (let index = 0; index < candidates.length; index += 1) {
-			const result = results[`candidate:${index}`]
-			if (result?.status === 'invalid')
-				return { failed: true, reason: result.reason ?? 'Invalid Jev Noul decision' }
-			const probability = result?.answer?.value
-			if (typeof probability === 'number' && probability > bestProbability) {
-				bestProbability = probability
-				bestIndex = index
+		const evaluate = async (
+			start: number,
+			end: number,
+			includeCompletion: boolean
+		): Promise<boolean> => {
+			try {
+				const results = await this.provider.decideMany(
+					{
+						requestId: this.nextRequestId(input.observation),
+						state,
+						judgments: [
+							...candidates.slice(start, end).map((candidate, offset) => ({
+								questionId: `candidate:${start + offset}`,
+								primitive: 'noul' as const,
+								need: input.need.kind,
+								risk: input.need.risk,
+								prompt: `Is this an appropriate immediate next action toward the current goal: ${candidateOption(candidate).label}?`,
+							})),
+							...(includeCompletion ? [completionJudgment(input.need)] : []),
+						],
+					},
+					signal
+				)
+				const completion = results.completion
+				if (completion?.status === 'invalid')
+					throw new Error(completion.reason ?? 'Invalid Jev completion judgment')
+				if (completionProbability(completion) > 0.5) return true
+				for (let index = start; index < end; index += 1) {
+					const result = results[`candidate:${index}`]
+					if (!result || result.status === 'invalid')
+						throw new Error(result?.reason ?? 'Invalid Jev Noul decision')
+					const probability = result.answer?.value
+					if (typeof probability === 'number' && probability > bestProbability) {
+						bestProbability = probability
+						bestIndex = index
+					}
+				}
+				return false
+			} catch (error) {
+				if (!isContextLimit(error) || end - start <= 1) throw error
+				const middle = start + Math.floor((end - start) / 2)
+				const first = await evaluate(start, middle, includeCompletion)
+				const second = await evaluate(middle, end, false)
+				return first || second
 			}
 		}
+		const completed = await evaluate(0, candidates.length, judgeCompletion)
+		if (completed) return { goalSatisfied: true }
 		return bestIndex >= 0
 			? { candidate: candidates[bestIndex] }
 			: {
@@ -619,7 +666,6 @@ function scrollCandidates(observation: PageObservation): ConcreteCandidate[] {
 
 function decisionState(
 	input: { session: Session; goal: GoalContract; observation: PageObservation },
-	candidates: ConcreteCandidate[],
 	attemptedCandidates: ConcreteCandidate[],
 	history: RecentSelection[]
 ): JsonValue {
@@ -643,24 +689,8 @@ function decisionState(
 					: { documentHeight: input.observation.viewport.documentHeight }),
 			},
 		},
-		candidates: candidates.map((candidate, index) => compactCandidate(candidate, index)),
-		attemptedCandidates: attemptedCandidates.map((candidate) => ({
-			action: candidate.action,
-			label: truncate(candidate.label, maxLabelChars),
-			signature: candidateSignature(candidate),
-		})),
+		attemptedCandidateCount: attemptedCandidates.length,
 		recentSelections: historyState(history),
-	}
-}
-
-function compactCandidate(candidate: ConcreteCandidate, index: number): JsonObject {
-	return {
-		index,
-		id: candidate.candidateId,
-		action: candidate.action,
-		label: truncate(candidate.label, maxLabelChars),
-		...(candidate.regionId ? { region: candidate.regionId } : {}),
-		...candidate.args,
 	}
 }
 
@@ -669,10 +699,14 @@ function candidateOption(candidate: ConcreteCandidate): JevOption {
 	const position = numberArg(candidate, 'y')
 	return {
 		id: candidate.candidateId,
-		label: `${candidate.label}${destination ? ` -> ${destination}` : ''}${
+		label: `${candidate.label}${destination ? ` -> ${truncate(destination, 200)}` : ''}${
 			position === undefined ? '' : ` at y=${position}`
 		}`,
 	}
+}
+
+function isContextLimit(error: unknown): boolean {
+	return error instanceof JevTransportError && error.code === 'CONTEXT_LIMIT'
 }
 
 function candidateSignature(candidate: ConcreteCandidate): string {

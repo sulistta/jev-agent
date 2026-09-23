@@ -67,7 +67,7 @@ export class DirectHttpJevTransport implements JevTransport {
 		if (!response.ok) {
 			const details = await readErrorDetails(response)
 			throw new JevTransportError(
-				'INVALID_REQUEST',
+				isContextLimitResponse(response.status, details) ? 'CONTEXT_LIMIT' : 'INVALID_REQUEST',
 				formatHttpError(endpoint, response.status, details),
 				false
 			)
@@ -83,6 +83,14 @@ export class DirectHttpJevTransport implements JevTransport {
 			throw new JevTransportError('INVALID_RESPONSE', 'Jev response schema is invalid', false)
 		return mapped
 	}
+}
+
+function isContextLimitResponse(status: number, details?: string): boolean {
+	return (
+		status === 413 ||
+		((status === 400 || status === 422) &&
+			/max_tokens_exceeded|context_length|context_limit/i.test(details ?? ''))
+	)
 }
 
 export class ProxyJevTransport extends DirectHttpJevTransport {}

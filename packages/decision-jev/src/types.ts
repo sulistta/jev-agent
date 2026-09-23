@@ -49,6 +49,7 @@ export interface JevTransport {
 export type JevTransportErrorCode =
 	| 'AUTH'
 	| 'INVALID_REQUEST'
+	| 'CONTEXT_LIMIT'
 	| 'RATE_LIMITED'
 	| 'TIMEOUT'
 	| 'CANCELLED'

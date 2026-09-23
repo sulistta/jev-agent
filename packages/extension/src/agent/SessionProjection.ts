@@ -19,11 +19,18 @@ export function projectSessionEvent(
 		}
 		case 'decision.selected': {
 			const candidateLabel = text(payload.candidateLabel)
+			const choices = parseChoices(text(payload.choices))
+			if ((payload.kind === 'failed' || payload.kind === 'blocked') && choices.length === 0)
+				return history
 			return [
 				...history,
 				{
-					type: 'observation',
-					content: `Decision: ${text(payload.kind) ?? 'unknown'}. ${text(payload.reason) ?? ''}${candidateLabel ? ` Selected: ${candidateLabel}.` : ''}`,
+					type: 'decision',
+					kind: text(payload.kind) ?? 'unknown',
+					selectedLabel: candidateLabel,
+					selectedOptionId: text(payload.selectedOptionId),
+					candidateCount: Number(text(payload.candidateCount)) || choices.length,
+					choices,
 				},
 			]
 		}
@@ -40,13 +47,7 @@ export function projectSessionEvent(
 		case 'user.reply':
 			return [...history, { type: 'observation', content: 'Reply received. Continuing task.' }]
 		case 'observation.captured':
-			return [
-				...history,
-				{
-					type: 'observation',
-					content: `Observed ${text(payload.elementCount) ?? 'the current page'}.`,
-				},
-			]
+			return history
 		case 'goal.updated':
 			return [
 				...history,
@@ -205,4 +206,21 @@ function asObject(value: JsonValue): Record<string, JsonValue> {
 
 function text(value: JsonValue | undefined): string | undefined {
 	return typeof value === 'string' ? value : undefined
+}
+
+function parseChoices(value?: string): { id: string; label: string }[] {
+	if (!value) return []
+	try {
+		const parsed: unknown = JSON.parse(value)
+		if (!Array.isArray(parsed)) return []
+		return parsed.filter(
+			(item): item is { id: string; label: string } =>
+				typeof item === 'object' &&
+				item !== null &&
+				typeof item.id === 'string' &&
+				typeof item.label === 'string'
+		)
+	} catch {
+		return []
+	}
 }
