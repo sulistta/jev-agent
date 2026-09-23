@@ -13,7 +13,8 @@ import { jsonStateBytes } from './transports'
 import type { JevDecisionResult, JevOption } from './types'
 
 const elementActions = ['click', 'input', 'select'] as const
-const choiceOptionLimit = 255
+// Reserve one Choice option for the explicit "none of the above" transition.
+const choiceOptionLimit = 254
 const maxLabelChars = 180
 const maxRecentSelectionsInState = 8
 
@@ -161,6 +162,12 @@ export class JevDecisionRouter implements DecisionRouter {
 				label: candidate.label,
 				candidateSignature: candidateSignature(candidate),
 				observationSignature: observationStateHash(input.observation),
+				...(candidate.target
+					? {
+							targetLocalId: candidate.target.localId,
+							documentId: candidate.target.documentId,
+						}
+					: {}),
 				page: {
 					url: input.observation.page.url,
 					title: input.observation.page.title,
@@ -193,7 +200,7 @@ export class JevDecisionRouter implements DecisionRouter {
 						prompt:
 							'Which concrete candidate is the best immediate next step toward the current goal?',
 						options: candidates.map(candidateOption),
-						allowNone: false,
+						allowNone: true,
 					},
 					...(judgeCompletion ? [completionJudgment(input.need)] : []),
 				],
@@ -212,7 +219,13 @@ export class JevDecisionRouter implements DecisionRouter {
 		// set to visible, enabled and supported concrete actions.
 		const selectedOptionId = result.selectedOptionId ?? result.answer?.selectedOptionId
 		const candidate = candidates.find((item) => item.candidateId === selectedOptionId)
-		return { candidate, reason: result.reason }
+		return {
+			candidate,
+			reason:
+				result.status === 'none'
+					? result.reason ?? 'Jev found no suitable action in the current page state'
+					: result.reason,
+		}
 	}
 
 	private async selectWithNoul(
@@ -440,8 +453,26 @@ function concreteCandidates(input: {
 	observation: PageObservation
 }): ConcreteCandidate[] {
 	const { observation } = input
+	const filledFields = new Set(
+		(input.session.actionJournal ?? [])
+			.filter(
+				(entry) =>
+					entry.status === 'executed' &&
+					entry.workItemId === input.goal.goalId &&
+					entry.action === 'input' &&
+					entry.selection?.page.url === observation.page.url &&
+					entry.selection.documentId === observation.documentId
+			)
+			.map((entry) => entry.selection?.targetLocalId)
+			.filter((id): id is string => id !== undefined)
+	)
 	const allElementCandidates = observation.elements.flatMap((element) =>
-		elementCandidates(observation, element)
+		elementCandidates(observation, element).filter(
+			(candidate) =>
+				candidate.action !== 'input' ||
+				element.valueState !== 'present' ||
+				!filledFields.has(element.ref.localId)
+		)
 	)
 	const modalRegionIds = new Set(
 		observation.regions.filter((region) => region.kind === 'modal').map((region) => region.regionId)

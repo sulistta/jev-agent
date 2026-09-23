@@ -94,6 +94,123 @@ describe('LocalBrowserRuntime', () => {
 		})
 	})
 
+	it('observes whether a contenteditable editor contains text', async () => {
+		await runtime.dispose()
+		document.body.innerHTML =
+			'<div id="editor" contenteditable="true" aria-label="Write a message"></div>'
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({
+			viewportExpansion: -1,
+			interactiveWhitelist: [document.querySelector<HTMLElement>('#editor')!],
+		})
+
+		const empty = await runtime.observe(request(), new AbortController().signal)
+		expect(empty.elements[0]).toMatchObject({ editable: true, valueState: 'empty' })
+
+		document.querySelector<HTMLElement>('#editor')!.textContent = 'Draft message'
+		const filled = await runtime.observe(request(), new AbortController().signal)
+		expect(filled.elements[0]).toMatchObject({ editable: true, valueState: 'present' })
+	})
+
+	it('fills a contenteditable editor and observes the newly enabled submit control', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = `
+			<div id="editor" contenteditable="true" aria-label="Write a message"></div>
+			<button id="send" disabled>Send</button>
+		`
+		const editor = document.querySelector<HTMLElement>('#editor')!
+		const send = document.querySelector<HTMLButtonElement>('#send')!
+		editor.addEventListener('input', () => {
+			send.disabled = (editor.innerText ?? editor.textContent ?? '').trim().length === 0
+		})
+		send.addEventListener('click', () => {
+			const published = document.createElement('p')
+			published.textContent = editor.innerText ?? editor.textContent ?? ''
+			document.body.append(published)
+			editor.textContent = ''
+			send.disabled = true
+		})
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({
+			viewportExpansion: -1,
+			interactiveWhitelist: [editor, send],
+		})
+		const before = await runtime.observe(request(), new AbortController().signal)
+		const editorRef = before.elements.find((element) => element.attributes.id === 'editor')!.ref
+
+		const receipt = await runtime.execute(
+			{
+				actionId: 'write-message',
+				sessionId,
+				expectedSessionRevision: before.revision,
+				action: {
+					type: 'input',
+					target: editorRef,
+					text: 'Hello there' as SecretAwareString,
+					replace: true,
+				},
+			},
+			new AbortController().signal
+		)
+		const after = await runtime.observe(request(), new AbortController().signal)
+
+		expect(receipt.status).toBe('executed')
+		expect(receipt.observedSignals).toEqual(
+			expect.arrayContaining([expect.objectContaining({ type: 'target.valueChanged' })])
+		)
+		expect(after.elements.find((element) => element.attributes.id === 'editor')).toMatchObject({
+			valueState: 'present',
+		})
+		expect(after.elements.find((element) => element.attributes.id === 'send')).toMatchObject({
+			enabled: true,
+		})
+		const sendRef = after.elements.find((element) => element.attributes.id === 'send')!.ref
+		const sent = await runtime.execute(
+			{
+				actionId: 'send-message',
+				sessionId,
+				expectedSessionRevision: after.revision,
+				action: { type: 'click', target: sendRef },
+			},
+			new AbortController().signal
+		)
+		expect(sent.status).toBe('executed')
+		expect(document.body.textContent).toContain('Hello there')
+		const published = await runtime.observe(request(), new AbortController().signal)
+		expect(published.elements.find((element) => element.attributes.id === 'editor')).toMatchObject({
+			valueState: 'empty',
+		})
+	})
+
+	it('reports an input failure when the page discards the typed value', async () => {
+		const field = document.querySelector<HTMLInputElement>('#query')!
+		field.addEventListener('input', () => { field.value = 'initial' })
+		const observation = await runtime.observe(request(), new AbortController().signal)
+		const query = observation.elements.find((element) => element.attributes.id === 'query')!
+
+		const receipt = await runtime.execute(
+			{
+				actionId: 'discarded-input',
+				sessionId,
+				expectedSessionRevision: observation.revision,
+				action: {
+					type: 'input',
+					target: query.ref,
+					text: 'New value' as SecretAwareString,
+					replace: true,
+				},
+			},
+			new AbortController().signal
+		)
+
+		expect(receipt).toMatchObject({
+			status: 'failed',
+			error: { code: 'INPUT_NOT_APPLIED' },
+			observedSignals: [],
+		})
+		expect(field.value).toBe('initial')
+	})
+
 	it('observes a generic pressed state for toggle controls', async () => {
 		await runtime.dispose()
 		document.body.innerHTML = '<button aria-label="Like this video" aria-pressed="true"></button>'

@@ -158,13 +158,13 @@ describe('JevDecisionRouter', () => {
 		expect(() => validateInputText('   ')).toThrow()
 	})
 
-	it('uses one direct Choice containing every concrete action up to 255', async () => {
-		const elements = Array.from({ length: 255 }, (_, index) => element(index, `Control ${index}`))
-		const selectedId = 'observation-1:jev:click:index:254'
+	it('uses one Choice for 254 actions and reserves the remaining option for none', async () => {
+		const elements = Array.from({ length: 254 }, (_, index) => element(index, `Control ${index}`))
+		const selectedId = 'observation-1:jev:click:index:253'
 		const transport = new MockJevTransport((request) => {
 			expect(request.questions).toHaveLength(1)
-			expect(request.questions[0]).toMatchObject({ primitive: 'choice', allowNone: false })
-			expect(request.questions[0].options).toHaveLength(255)
+			expect(request.questions[0]).toMatchObject({ primitive: 'choice', allowNone: true })
+			expect(request.questions[0].options).toHaveLength(254)
 			expect(request.questions[0].options?.at(-1)?.id).toBe(selectedId)
 			return choiceResponse(request, selectedId)
 		})
@@ -175,13 +175,13 @@ describe('JevDecisionRouter', () => {
 		expect(result).toMatchObject({
 			kind: 'action',
 			candidateId: selectedId,
-			selection: { label: 'click Control 254' },
-			action: { type: 'click', target: { localId: 'index:254' } },
+			selection: { label: 'click Control 253' },
+			action: { type: 'click', target: { localId: 'index:253' } },
 		})
 		expect(transport.requests).toHaveLength(1)
 	})
 
-	it('uses parallel Noul judgments in one request above 255 actions', async () => {
+	it('uses parallel Noul judgments in one request above 254 actions', async () => {
 		const elements = Array.from({ length: 274 }, (_, index) =>
 			element(index, index === 273 ? 'Gostei' : `Control ${index}`)
 		)
@@ -273,6 +273,71 @@ describe('JevDecisionRouter', () => {
 				new AbortController().signal
 			)
 		).resolves.toMatchObject({ action: { target: { localId: 'index:1' } } })
+	})
+
+	it('selects a publish control after a successfully filled editor without offering input again', async () => {
+		const editor = {
+			...element(0, 'Write a message'),
+			tagName: 'div',
+			editable: true,
+			valueState: 'present' as const,
+			supportedActions: ['input' as const, 'click' as const],
+		}
+		const publish = element(1, 'Publish')
+		const selectedId = 'observation-2:jev:click:index:1'
+		const transport = new MockJevTransport((request) => {
+			const options = request.questions.find((question) => question.questionId === 'action')?.options
+			expect(options?.map((option) => option.id)).toEqual([
+				'observation-2:jev:click:index:0',
+				selectedId,
+			])
+			return {
+				requestId: request.requestId,
+				answers: request.questions.map((question) =>
+					question.questionId === 'completion'
+						? { questionId: question.questionId, value: 0.1 }
+						: { questionId: question.questionId, selectedOptionId: selectedId, confidence: 0.99 }
+				),
+			}
+		})
+		const filledSession: Session = {
+			...session,
+			actionJournal: [
+				{
+					actionId: 'fill-editor',
+					workItemId: goal.goalId,
+					action: 'input',
+					label: 'input Write a message',
+					selection: {
+						action: 'input',
+						label: 'input Write a message',
+						candidateSignature: 'draft',
+						observationSignature: 'before-input',
+						page: observation.page,
+						targetLocalId: editor.ref.localId,
+						documentId: observation.documentId,
+					},
+					status: 'executed',
+					observationId: observation.observationId,
+					completedAt: observation.capturedAt,
+				},
+			],
+		}
+		const decision = await new JevDecisionRouter(provider(transport)).decide(
+				{
+					session: filledSession,
+					goal,
+					observation: {
+						...observation,
+						observationId: 'observation-2',
+						elements: [editor, publish],
+					},
+					need,
+				},
+				new AbortController().signal
+			)
+		expect(decision.kind, decision.reason).toBe('action')
+		expect(decision).toMatchObject({ action: { type: 'click', target: publish.ref } })
 	})
 
 	it('uses supportedActions as the structural source of truth', async () => {
@@ -385,7 +450,7 @@ describe('JevDecisionRouter', () => {
 		const transport = new MockJevTransport((request) => {
 			expect(request.questions[0]).toMatchObject({
 				primitive: 'choice',
-				allowNone: false,
+				allowNone: true,
 				options: [
 					expect.objectContaining({
 						id: candidateId,
@@ -414,19 +479,19 @@ describe('JevDecisionRouter', () => {
 		expect(result.action).toEqual({ type: 'tab.open', url: 'https://unregistered.example/path' })
 	})
 
-	it('does not add an abstract none option to concrete Choice actions', async () => {
+	it('allows Jev to reject every concrete action without executing one', async () => {
 		const selectedId = 'observation-1:jev:click:index:0'
 		const transport = new MockJevTransport((request) => {
-			expect(request.questions[0]).toMatchObject({ allowNone: false })
+			expect(request.questions[0]).toMatchObject({ allowNone: true })
 			expect(request.questions[0].options).toEqual([expect.objectContaining({ id: selectedId })])
-			return choiceResponse(request, selectedId)
+			return choiceResponse(request, 'none_of_the_above')
 		})
 		await expect(
 			new JevDecisionRouter(provider(transport)).decide(
 				{ session, goal, observation, need },
 				new AbortController().signal
 			)
-		).resolves.toMatchObject({ kind: 'action', candidateId: selectedId })
+		).resolves.toMatchObject({ kind: 'blocked', reason: expect.stringContaining('safe none') })
 		expect(transport.requests).toHaveLength(1)
 	})
 
@@ -446,7 +511,7 @@ describe('JevDecisionRouter', () => {
 	})
 
 	it('blocks after every Noul candidate is evaluated as unsuitable', async () => {
-		const elements = Array.from({ length: 256 }, (_, index) => element(index, `Control ${index}`))
+		const elements = Array.from({ length: 255 }, (_, index) => element(index, `Control ${index}`))
 		const transport = new MockJevTransport((request) => ({
 			requestId: request.requestId,
 			answers: request.questions.map((question) => ({
@@ -462,7 +527,7 @@ describe('JevDecisionRouter', () => {
 			)
 		).resolves.toMatchObject({
 			kind: 'blocked',
-			reason: expect.stringContaining('all 256 candidates'),
+			reason: expect.stringContaining('all 255 candidates'),
 		})
 		expect(transport.requests).toHaveLength(1)
 	})

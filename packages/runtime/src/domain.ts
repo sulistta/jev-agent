@@ -206,6 +206,8 @@ export interface ActionSelection {
 	candidateSignature: string
 	observationSignature: string
 	page: { url: string; title: string }
+	targetLocalId?: string
+	documentId?: string
 }
 
 export type TaskMode = 'conversation' | 'browser'

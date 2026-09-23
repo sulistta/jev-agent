@@ -267,7 +267,9 @@ function valueSnapshot(element: HTMLElement): string {
 		element instanceof HTMLTextAreaElement ||
 		element instanceof HTMLSelectElement
 		? element.value
-		: (element.textContent ?? '')
+		: element.isContentEditable
+			? (element.innerText ?? element.textContent ?? '')
+			: (element.textContent ?? '')
 }
 
 function uniqueReplacement(record: ElementRecord): HTMLElement | undefined {
@@ -330,13 +332,9 @@ function valueStateFor(
 	element: HTMLElement,
 	level: 'public' | 'internal' | 'sensitive' | 'secret'
 ): 'empty' | 'present' | 'masked' | undefined {
-	const hasValue =
-		element instanceof HTMLInputElement ||
-		element instanceof HTMLTextAreaElement ||
-		element instanceof HTMLSelectElement
-	if (!hasValue) return undefined
+	if (!isEditableTextElement(element) && !(element instanceof HTMLSelectElement)) return undefined
 	if (level === 'secret') return 'masked'
-	return element.value.length === 0 ? 'empty' : 'present'
+	return valueSnapshot(element).trim().length === 0 ? 'empty' : 'present'
 }
 
 function regionKind(
@@ -550,6 +548,13 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 			characterData: true,
 		})
 		try {
+			const targetRecord =
+				request.action.type === 'input' || request.action.type === 'select'
+					? this.records.get(request.action.target.localId)
+					: undefined
+			const valueBefore = targetRecord?.element.isConnected
+				? valueSnapshot(targetRecord.element)
+				: undefined
 			const result = await this.executeAction(
 				request.action,
 				request.sessionId,
@@ -563,7 +568,11 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 			if (mutations.length > 0) signals.push(signalEvent('dom.mutated', { relevant: true }))
 			if (window.location.href !== urlBeforeAction)
 				signals.push(signalEvent('route.changed', { url: window.location.href }))
-			if (request.action.type === 'input' || request.action.type === 'select') {
+			if (
+				(request.action.type === 'input' || request.action.type === 'select') &&
+				targetRecord?.element.isConnected &&
+				valueSnapshot(targetRecord.element) !== valueBefore
+			) {
 				signals.push(signalEvent('target.valueChanged', { localId: request.action.target.localId }))
 			}
 			this.lastSignals = signals
@@ -801,6 +810,12 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				return { effect: { type: 'element.updated', ref: action.target } as const }
 			case 'input':
 				await inputTextElement(requiredTarget(target), action.text)
+				if (
+					!target?.isConnected ||
+					valueSnapshot(target).trim() !== action.text.trim()
+				) {
+					throw new Error('INPUT_NOT_APPLIED')
+				}
 				return { effect: { type: 'element.updated', ref: action.target } as const }
 			case 'select': {
 				if (!(target instanceof HTMLSelectElement)) throw new Error('TARGET_NOT_FOUND')
@@ -945,6 +960,7 @@ function toRuntimeError(error: unknown): BrowserRuntimeError {
 		STALE_REFERENCE: 'STALE_REFERENCE',
 		TAB_UNAVAILABLE: 'TAB_UNAVAILABLE',
 		TARGET_NOT_FOUND: 'TARGET_NOT_FOUND',
+		INPUT_NOT_APPLIED: 'INPUT_NOT_APPLIED',
 	}
 	const code = codes[message] ?? 'INTERNAL'
 	return browserError(code, message, code === 'STALE_REFERENCE' || code === 'CANCELLED')
