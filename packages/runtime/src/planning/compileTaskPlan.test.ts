@@ -40,6 +40,11 @@ describe('compileTaskPlan', () => {
 			}),
 		])
 		expect(compiled.workItems.some((item) => item.workItemId === 'identify-target')).toBe(false)
+		expect(compiled.planningHints?.map((item) => item.description)).toEqual([
+			'locate-channel',
+			'identify-target',
+			'like-target',
+		])
 	})
 
 	it('keeps research coverage separate and runs the operation after required research', () => {

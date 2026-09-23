@@ -14,6 +14,7 @@ import type {
 	TaskPlan,
 } from '../domain'
 import type { RuntimeError } from '../errors/RuntimeError'
+import type { ObservationChanges } from '../observationChanges'
 import type { ConfirmationTokenManager } from '../security/ConfirmationTokens'
 
 export interface Clock {
@@ -80,6 +81,7 @@ export interface DecisionRouter {
 			session: Session
 			goal: GoalContract
 			observation: PageObservation
+			changes?: ObservationChanges
 			need: DecisionNeed
 		},
 		signal: AbortSignal

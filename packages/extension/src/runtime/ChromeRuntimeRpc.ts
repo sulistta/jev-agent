@@ -31,7 +31,7 @@ export class ExtensionRpcError extends Error {
 }
 
 /**
- * Runner-side transport. The service worker owns routing and Chrome APIs;
+ * Side-panel transport. The service worker owns routing and Chrome APIs;
  * this class only validates the response envelope and propagates cancellation.
  */
 export class ChromeRuntimeRpc {

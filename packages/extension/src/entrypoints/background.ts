@@ -1,3 +1,4 @@
+import { handlePanelUiMessage } from '@/agent/PanelUi.background'
 import {
 	handleContentDocumentHello,
 	handleProtocolRpcMessage,
@@ -7,19 +8,17 @@ import {
 	createOriginGrant,
 	handlePublicApiMessage,
 	listOriginGrants,
-	registerPublicRunnerPort,
+	registerPublicPanelPort,
 	revokeOriginGrant,
 } from '@/agent/PublicApi.background'
 import { handlePageControlMessage } from '@/agent/RemotePageController.background'
-import { handleRunnerUiMessage } from '@/agent/RunnerUi.background'
 import { handleTabControlMessage } from '@/agent/TabsController.background'
 
 export default defineBackground(() => {
 	console.log('[Background] Service Worker started')
 	registerProtocolTabLifecycle()
-
 	chrome.runtime.onConnect.addListener((port) => {
-		if (port.name === 'page-agent-runner-v2') registerPublicRunnerPort(port)
+		if (port.name === 'page-agent-panel-host-v2') registerPublicPanelPort(port)
 	})
 
 	// generate user auth token
@@ -51,12 +50,8 @@ export default defineBackground(() => {
 			message?.type === 'PAGE_AGENT_V2_UI_CANCEL' ||
 			message?.type === 'PAGE_AGENT_V2_UI_REPLY'
 		) {
-			handleRunnerUiMessage(message, sender).then(sendResponse)
+			handlePanelUiMessage(message, sender).then(sendResponse)
 			return true
-		}
-		if (message?.type === 'PAGE_AGENT_V2_RUNNER_READY') {
-			sendResponse({ ok: true })
-			return
 		}
 		if (message?.type === 'PAGE_AGENT_V2_PUBLIC') {
 			handlePublicApiMessage(message, sender).then(sendResponse)

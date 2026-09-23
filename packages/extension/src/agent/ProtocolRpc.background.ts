@@ -20,6 +20,17 @@ const OWNER_KEY = 'pageAgentTabOwners'
 const documentEndpoints = new Map<number, { documentId: string; frameId: number }>()
 const documentEndpointWaiters = new Map<number, Set<() => void>>()
 
+/** Ask each live document endpoint to remove feedback for the completed session. */
+export function endVisualSession(sessionId: string): void {
+	for (const tabId of documentEndpoints.keys()) {
+		void chrome.tabs
+			.sendMessage(tabId, { type: 'PAGE_AGENT_V2_VISUAL_END', sessionId })
+			.catch(() => {
+				// Navigation may have replaced the content script already.
+			})
+	}
+}
+
 interface ProtocolRpcMessage {
 	type: 'PAGE_AGENT_V2_RPC'
 	payload: DomRpcRequest | TabRpcRequest
@@ -575,6 +586,18 @@ async function readOwners(): Promise<TabOwnerMap> {
 
 async function writeOwners(owners: TabOwnerMap): Promise<void> {
 	await chrome.storage.session.set({ [OWNER_KEY]: owners })
+}
+
+/** Release claims left by an execution whose panel document was destroyed. */
+export async function releaseSessionTabOwners(sessionId: string): Promise<void> {
+	const owners = await readOwners()
+	let changed = false
+	for (const [tabId, owner] of Object.entries(owners)) {
+		if (owner !== sessionId) continue
+		delete owners[tabId]
+		changed = true
+	}
+	if (changed) await writeOwners(owners)
 }
 
 function success(value: unknown): ExtensionRpcSuccess {

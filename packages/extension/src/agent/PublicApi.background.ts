@@ -16,11 +16,11 @@ import {
 } from '@/security/OriginGrants'
 
 import {
-	ensureRunnerTab,
-	registerRunnerPort,
-	runnerGateway,
-	subscribeRunnerEvents,
-} from './RunnerPort.background'
+	panelGateway,
+	registerPanelPort,
+	subscribePanelEvents,
+	waitForPanelPort,
+} from './PanelPort.background'
 
 export interface PublicSessionGateway {
 	start(
@@ -50,7 +50,7 @@ const randomIds = {
 		return `${kind}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`
 	},
 }
-let gateway: PublicSessionGateway | undefined = runnerGateway()
+let gateway: PublicSessionGateway | undefined = panelGateway()
 const publicSessionTabs = new Map<string, number>()
 const bufferedPublicEvents = new Map<string, PublicSessionEvent[]>()
 const grants = new OriginGrantManager(
@@ -60,7 +60,7 @@ const grants = new OriginGrantManager(
 	new ChromeStorageNonceStore()
 )
 
-subscribeRunnerEvents(({ sessionId, event }) => {
+subscribePanelEvents(({ sessionId, event }) => {
 	const tabId = publicSessionTabs.get(sessionId)
 	if (tabId === undefined) {
 		const buffered = bufferedPublicEvents.get(sessionId) ?? []
@@ -77,8 +77,8 @@ export function configurePublicSessionGateway(next: PublicSessionGateway | undef
 	gateway = next
 }
 
-export function registerPublicRunnerPort(port: chrome.runtime.Port): void {
-	registerRunnerPort(port)
+export function registerPublicPanelPort(port: chrome.runtime.Port): void {
+	registerPanelPort(port)
 }
 
 type GrantSummary = Pick<
@@ -174,9 +174,16 @@ export async function handlePublicApiMessage(
 		)
 	if (!gateway)
 		return failure(
-			'RUNNER_UNAVAILABLE',
-			'The extension runner is not connected',
-			true,
+			'PANEL_NOT_OPEN',
+			'Open the Page Agent side panel before using the extension API',
+			false,
+			request.requestId
+		)
+	if (!(await waitForPanelPort(250)))
+		return failure(
+			'PANEL_NOT_OPEN',
+			'Open the Page Agent side panel before using the extension API',
+			false,
 			request.requestId
 		)
 
@@ -216,16 +223,15 @@ export async function handlePublicApiMessage(
 		return { requestId: request.requestId, ok: true, payload: await gateway.result(request) }
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error)
-		if (message === 'RUNNER_UNAVAILABLE') {
-			await ensureRunnerTab()
+		if (message === 'PANEL_NOT_OPEN') {
 			return failure(
-				'RUNNER_STARTING',
-				'The extension runner is starting; retry the request',
-				true,
+				'PANEL_NOT_OPEN',
+				'Open the Page Agent side panel before using the extension API',
+				false,
 				request.requestId
 			)
 		}
-		return failure('RUNNER_ERROR', message, true, request.requestId)
+		return failure('PANEL_ERROR', message, true, request.requestId)
 	}
 }
 

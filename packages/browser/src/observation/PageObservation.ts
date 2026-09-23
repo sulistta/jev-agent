@@ -71,6 +71,7 @@ export type BrowserSignal =
 	| { type: 'document.changed'; at: string; documentId: string }
 	| { type: 'route.changed'; at: string; url: string }
 	| { type: 'dom.mutated'; at: string; relevant: boolean }
+	| { type: 'control.changed'; at: string }
 	| { type: 'target.appeared'; at: string; localId: string }
 	| { type: 'target.disappeared'; at: string; localId: string }
 	| { type: 'target.valueChanged'; at: string; localId: string }

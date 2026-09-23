@@ -44,7 +44,7 @@ let requestSequence = 0
  *
  * The old page-facing shape is kept at the edge only. The content script no
  * longer imports or constructs the legacy agent; all execution goes through
- * the v2 public-session grant and runner path.
+ * the v2 public-session grant and side-panel host.
  */
 export function initLegacyPageApiAdapter(): void {
 	let active: ActiveExecution | undefined

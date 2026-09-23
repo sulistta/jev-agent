@@ -58,6 +58,21 @@ describe('SessionProjection', () => {
 		])
 	})
 
+	it('projects concrete action choices', () => {
+		const history = projectSessionEvent(
+			[],
+			event('decision.selected', {
+				kind: 'action',
+				candidateLabel: 'click Publish',
+				selectedOptionId: 'target-2',
+				choices: JSON.stringify([{ id: 'target-2', label: 'Publish' }]),
+			})
+		)
+		expect(history[0]).toMatchObject({
+			choices: [{ id: 'target-2', label: 'Publish' }],
+		})
+	})
+
 	it('does not show a repeated technical decision error before the final error card', () => {
 		const history = projectSessionEvent(
 			[],

@@ -81,7 +81,7 @@ export interface JevDecisionContext {
 }
 
 export interface JevDecisionResult {
-	status: 'selected' | 'none' | 'escalate' | 'invalid'
+	status: 'selected' | 'none' | 'invalid'
 	selectedOptionId?: string
 	confidence?: number
 	answer?: JevAnswer

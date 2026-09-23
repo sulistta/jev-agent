@@ -1,7 +1,11 @@
 import { PROTOCOL_VERSION } from '@page-agent/protocol'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { handleContentDocumentHello, handleProtocolRpcMessage } from './ProtocolRpc.background'
+import {
+	endVisualSession,
+	handleContentDocumentHello,
+	handleProtocolRpcMessage,
+} from './ProtocolRpc.background'
 
 const tabId = 9191
 
@@ -27,6 +31,18 @@ afterEach(() => {
 })
 
 describe('Protocol RPC document transitions', () => {
+	it('notifies live content endpoints to clear visuals when a session ends', async () => {
+		const sendMessage = vi.fn(async () => undefined)
+		vi.stubGlobal('chrome', { tabs: { sendMessage } })
+		announceDocument('document-visual')
+		endVisualSession('session-visual')
+		await vi.waitFor(() =>
+			expect(sendMessage).toHaveBeenCalledWith(tabId, {
+				type: 'PAGE_AGENT_V2_VISUAL_END',
+				sessionId: 'session-visual',
+			})
+		)
+	})
 	it('routes a viewport scroll to the explicitly selected tab', async () => {
 		const sendMessage = vi.fn(async () => ({
 			ok: true,

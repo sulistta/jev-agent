@@ -139,6 +139,8 @@ export interface TaskPlan {
 	originalLanguage: string
 	missingInputs: { key: string; question: string }[]
 	workItems: TaskWorkItem[]
+	/** Ordered semantic hints retained for Jev; never executable goals. */
+	planningHints?: { description: string; successCriteria: string[] }[]
 	coverage: CoverageRequirement[]
 	deliverable: string
 	externalActions: string[]
@@ -206,6 +208,7 @@ export interface ActionSelection {
 	candidateSignature: string
 	observationSignature: string
 	page: { url: string; title: string }
+	viewport?: { scrollY: number; height: number }
 	targetLocalId?: string
 	documentId?: string
 }

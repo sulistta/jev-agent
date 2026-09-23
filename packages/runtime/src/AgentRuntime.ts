@@ -16,6 +16,7 @@ import type {
 	TaskWorkItem,
 } from './domain'
 import { type RuntimeError } from './errors/RuntimeError'
+import { type ObservationChanges, compareObservations } from './observationChanges'
 import { researchCoverageSatisfied } from './outcomes/researchCoverage'
 import { compileTaskPlan } from './planning/compileTaskPlan'
 import { type RuntimeDependencies, createDefaultBudgets, createTaskContract } from './ports'
@@ -292,6 +293,12 @@ class SessionExecution implements SessionHandle {
 			let actions = 0
 			let noProgress = 0
 			let stateBeforeLastExecutedAction: string | undefined
+			let previousActionObservation: PageObservation | undefined
+			let previousActionType: string | undefined
+			let inputRecoveryUsed = false
+			let pendingTextSubmission:
+				| { text: string; beforeContent: Set<string>; clicked: Set<string>; published: boolean }
+				| undefined
 
 			while (true) {
 				await this.waitUntilRunnable()
@@ -316,6 +323,24 @@ class SessionExecution implements SessionHandle {
 
 				session = await this.setPhase(session, 'observing')
 				const observation = await this.observe(session, workItemForGoal(session.plan, goal.goalId))
+				const changes: ObservationChanges | undefined =
+					previousActionObservation && previousActionType
+						? compareObservations(previousActionObservation, observation, previousActionType)
+						: undefined
+				if (pendingTextSubmission && changes) {
+					const submission = pendingTextSubmission
+					if (pendingTextSubmission.clicked.size > 0 && !pendingTextSubmission.published)
+						pendingTextSubmission.published = (observation.content ?? []).some(
+							(block) =>
+								!submission.beforeContent.has(block.contentHash) &&
+								normalizeEvidenceText(block.text).includes(submission.text)
+						)
+					changes.submission = pendingTextSubmission.published
+						? 'published'
+						: pendingTextSubmission.clicked.size > 0
+							? 'clicked_unverified'
+							: 'draft'
+				}
 				const observationFingerprint = runtimeObservationFingerprint(observation)
 				if (stateBeforeLastExecutedAction !== undefined) {
 					noProgress = stateBeforeLastExecutedAction === observationFingerprint ? noProgress + 1 : 0
@@ -332,7 +357,10 @@ class SessionExecution implements SessionHandle {
 					status: verification.status,
 					evidenceCount: String(verification.evidence.length),
 				})
-				if (verification.status === 'satisfied') {
+				if (
+					verification.status === 'satisfied' &&
+					!submissionUnverified(session, pendingTextSubmission)
+				) {
 					session = await this.updateGoal(session, goal.goalId, 'satisfied', verification.evidence)
 					noProgress = 0
 					continue
@@ -352,6 +380,7 @@ class SessionExecution implements SessionHandle {
 						session,
 						goal,
 						observation,
+						changes,
 						need: {
 							kind: 'select_operation',
 							closedWorld: true,
@@ -374,9 +403,19 @@ class SessionExecution implements SessionHandle {
 					confidence: String(decision.diagnostics?.confidence ?? ''),
 					selectedTransition: decision.diagnostics?.selectedTransition ?? '',
 					choices: JSON.stringify(decision.diagnostics?.choices ?? []),
+					observedChanges: JSON.stringify(changes ?? null),
+					offViewportControls: JSON.stringify(observation.metadata?.offViewportControls ?? null),
 				})
 
 				if (decision.kind === 'goal_satisfied') {
+					if (submissionUnverified(session, pendingTextSubmission))
+						return await this.block(
+							session,
+							'NO_PROGRESS',
+							pendingTextSubmission?.clicked.size
+								? 'The submit action may have run, but publication was not observed. Check the page before retrying.'
+								: 'The text is still a draft; publication has not been observed.'
+						)
 					const workItem = workItemForGoal(session.plan, goal.goalId)
 					if (workItem?.kind === 'research' && !researchCoverageSatisfied(session, goal.goalId))
 						return await this.block(
@@ -395,8 +434,37 @@ class SessionExecution implements SessionHandle {
 					session = await this.transition(session, 'waiting_user')
 					continue
 				}
-				if (decision.kind === 'blocked')
-					return await this.block(session, 'NO_PROGRESS', decision.reason ?? 'Decision blocked')
+				if (decision.kind === 'blocked') {
+					if (previousActionType === 'input' && !inputRecoveryUsed) {
+						inputRecoveryUsed = true
+						const synchronization = await this.dependencies.browser.waitFor(
+							{
+								sessionId: session.sessionId,
+								tabId: session.browserScope.activeTabId ?? 'in-page',
+								since: observation.capturedAt,
+								expected: [{ type: 'control.changed' }],
+								settle: { quietWindowMs: 250, maxWaitMs: 2_000 },
+							},
+							this.abortController.signal
+						)
+						if (synchronization.status === 'cancelled') this.assertNotCancelled()
+						if (synchronization.status === 'error')
+							return await this.fail(session, synchronization.error.message)
+						const refreshed = await this.observe(
+							session,
+							workItemForGoal(session.plan, goal.goalId)
+						)
+						if (runtimeObservationFingerprint(refreshed) !== observationFingerprint) continue
+					}
+					return await this.block(
+						session,
+						'NO_PROGRESS',
+						submissionUnverified(session, pendingTextSubmission) &&
+							pendingTextSubmission?.clicked.size
+							? 'The submit action may have run, but publication was not observed. Check the page before retrying.'
+							: (decision.reason ?? 'Decision blocked')
+					)
+				}
 				if (decision.kind === 'failed')
 					return await this.fail(session, decision.reason ?? 'Decision failed')
 				if (decision.kind !== 'action' || !decision.action) {
@@ -436,6 +504,18 @@ class SessionExecution implements SessionHandle {
 					}
 				}
 				const action = executableDecision.action!
+				if (
+					action.type === 'click' &&
+					pendingTextSubmission &&
+					!pendingTextSubmission.published &&
+					decision.selection?.candidateSignature &&
+					pendingTextSubmission.clicked.has(decision.selection.candidateSignature)
+				)
+					return await this.block(
+						session,
+						'NO_PROGRESS',
+						'The same control was already clicked after entering text, but publication was not observed. Check the page before retrying.'
+					)
 
 				const authorization = await this.dependencies.policy.authorize(
 					{ session, decision: executableDecision },
@@ -580,6 +660,26 @@ class SessionExecution implements SessionHandle {
 						)
 					continue
 				}
+				if (action.type === 'input') {
+					const field = observation.elements.find(
+						(element) => element.ref.localId === action.target.localId
+					)
+					pendingTextSubmission =
+						field && field.editable && field.tagName !== 'input'
+							? {
+									text: normalizeEvidenceText(action.text),
+									beforeContent: new Set(
+										(observation.content ?? []).map((block) => block.contentHash)
+									),
+									clicked: new Set(),
+									published: false,
+								}
+							: undefined
+				}
+				if (action.type === 'click' && pendingTextSubmission)
+					pendingTextSubmission.clicked.add(
+						decision.selection?.candidateSignature ?? action.target.localId
+					)
 				session = await this.setPhase(session, 'settling')
 				const synchronization = tabEffectConfirmsAction(receipt, action)
 					? {
@@ -613,6 +713,9 @@ class SessionExecution implements SessionHandle {
 				// can complete between the action receipt and wait subscription. Observe
 				// the current state and compare it with the pre-action fingerprint.
 				stateBeforeLastExecutedAction = observationFingerprint
+				previousActionObservation = observation
+				previousActionType = action.type
+				inputRecoveryUsed = false
 				continue
 			}
 		} catch (error) {
@@ -1032,6 +1135,13 @@ class SessionExecution implements SessionHandle {
 	}
 }
 
+function submissionUnverified(
+	session: Session,
+	submission: { published: boolean } | undefined
+): boolean {
+	return Boolean(submission && !submission.published && session.plan?.externalActions.length)
+}
+
 function expectedChanges(action: BrowserAction): ExpectedChange[] {
 	switch (action.type) {
 		case 'input':
@@ -1154,11 +1264,14 @@ function runtimeObservationFingerprint(observation: PageObservation): string {
 		JSON.stringify({
 			page: observation.page,
 			viewport: observation.viewport,
+			metadata: observation.metadata,
 			content: (observation.content ?? []).map((block) => block.contentHash),
 			elements: observation.elements.map((element) => ({
 				tagName: element.tagName,
 				role: element.role,
 				name: element.accessibleName,
+				enabled: element.enabled,
+				supportedActions: element.supportedActions,
 				text: element.text,
 				valueState: element.valueState,
 				href: element.attributes.href,

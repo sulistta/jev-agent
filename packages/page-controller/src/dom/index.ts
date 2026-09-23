@@ -22,6 +22,7 @@ export function resolveViewportExpansion(viewportExpansion?: number): number {
 }
 
 export interface DomConfig {
+	doHighlightElements?: boolean
 	viewportExpansion?: number
 	interactiveBlacklist?: (Element | (() => Element))[]
 	interactiveWhitelist?: (Element | (() => Element))[]
@@ -76,7 +77,7 @@ export function getFlatTree(config: DomConfig): FlatDomTree {
 	}
 
 	const elements = domTree({
-		doHighlightElements: true,
+		doHighlightElements: config.doHighlightElements ?? true,
 		debugMode: true,
 		focusHighlightIndex: -1,
 		viewportExpansion,

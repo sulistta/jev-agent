@@ -270,6 +270,9 @@ function StepCard({ event }: { event: AgentStepEvent }) {
 
 function DecisionCard({ event }: { event: DecisionEvent }) {
 	const selected = event.choices.find((choice) => choice.id === event.selectedOptionId)
+	const choiceGroups = event.choices.length
+		? [{ title: 'Choices considered', choices: event.choices, selectedId: event.selectedOptionId }]
+		: []
 	const outcome =
 		event.kind === 'goal_satisfied'
 			? 'Goal complete'
@@ -295,28 +298,28 @@ function DecisionCard({ event }: { event: DecisionEvent }) {
 					</div>
 				</div>
 			</div>
-			{event.choices.length > 0 && (
-				<details className="mt-2 border-t pt-1.5 group">
+			{choiceGroups.map((group) => (
+				<details key={group.title} className="mt-2 border-t pt-1.5 group">
 					<summary className="flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground list-none">
 						<ChevronRight className="size-3 transition-transform group-open:rotate-90" />
-						Choices considered ({event.candidateCount})
+						{group.title} ({group.choices.length})
 					</summary>
 					<ol className="mt-2 max-h-52 overflow-y-auto space-y-1 pl-4 list-decimal text-[11px] text-muted-foreground">
-						{event.choices.map((choice) => (
+						{group.choices.map((choice) => (
 							<li
 								key={choice.id}
 								className={cn(
 									'break-words',
-									choice.id === event.selectedOptionId && 'text-foreground font-medium'
+									choice.id === group.selectedId && 'text-foreground font-medium'
 								)}
 							>
 								{choice.label}
-								{choice.id === event.selectedOptionId ? ' ✓' : ''}
+								{choice.id === group.selectedId ? ' ✓' : ''}
 							</li>
 						))}
 					</ol>
 				</details>
-			)}
+			))}
 		</div>
 	)
 }

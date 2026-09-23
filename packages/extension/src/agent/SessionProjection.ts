@@ -20,7 +20,10 @@ export function projectSessionEvent(
 		case 'decision.selected': {
 			const candidateLabel = text(payload.candidateLabel)
 			const choices = parseChoices(text(payload.choices))
-			if ((payload.kind === 'failed' || payload.kind === 'blocked') && choices.length === 0)
+			if (
+				(payload.kind === 'failed' || payload.kind === 'blocked') &&
+				choices.length === 0
+			)
 				return history
 			return [
 				...history,

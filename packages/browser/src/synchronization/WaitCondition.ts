@@ -5,6 +5,7 @@ export interface ExpectedChange {
 		| 'navigation'
 		| 'document'
 		| 'dom'
+		| 'control.changed'
 		| 'target.value'
 		| 'target.appeared'
 		| 'target.disappeared'

@@ -5,16 +5,15 @@ import {
 	JevDecisionRouter,
 	JevTaskRouter,
 	RetryingJevTransport,
-	SeedThresholdPolicy,
 } from '@page-agent/decision-jev'
 import type { PublicSessionStartPayload } from '@page-agent/protocol'
 import type { DecisionRouter, SemanticTextProvider, TaskRouter } from '@page-agent/runtime'
 
-import type { RunnerRequestPayload } from '@/agent/RunnerPort.background'
+import type { PanelRequestPayload } from '@/agent/PanelPort.background'
 import { ChromeRuntimeRpc } from '@/runtime/ChromeRuntimeRpc'
 import { ExtensionBrowserRuntime } from '@/runtime/ExtensionBrowserRuntime'
 import { OpenAiCompatibleSemanticTextProvider } from '@/runtime/OpenAiCompatibleSemanticTextProvider'
-import { createRunnerHost } from '@/runtime/RunnerHost'
+import { createPanelRuntime } from '@/runtime/PanelRuntime'
 
 const handles = new Map<string, import('@page-agent/runtime').SessionHandle>()
 let backgroundPort: chrome.runtime.Port | undefined
@@ -23,14 +22,14 @@ const pendingEvents: unknown[] = []
 
 function connectBackground(): void {
 	if (backgroundPort) return
-	const port = chrome.runtime.connect({ name: 'page-agent-runner-v2' })
+	const port = chrome.runtime.connect({ name: 'page-agent-panel-host-v2' })
 	backgroundPort = port
 	port.onMessage.addListener((message: unknown) => {
-		if (!isRunnerRequest(message)) return
+		if (!isPanelRequest(message)) return
 		void handle(message.payload)
 			.then((value) => {
 				postResponse(port, {
-					type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
+					type: 'PAGE_AGENT_V2_PANEL_RESPONSE',
 					requestId: message.requestId,
 					ok: true,
 					value,
@@ -38,11 +37,11 @@ function connectBackground(): void {
 			})
 			.catch((error: unknown) => {
 				postResponse(port, {
-					type: 'PAGE_AGENT_V2_RUNNER_RESPONSE',
+					type: 'PAGE_AGENT_V2_PANEL_RESPONSE',
 					requestId: message.requestId,
 					ok: false,
 					error: {
-						code: 'RUNNER_ERROR',
+						code: 'PANEL_ERROR',
 						message: error instanceof Error ? error.message : String(error),
 					},
 				})
@@ -98,7 +97,7 @@ function flushPendingEvents(): void {
 	}
 }
 
-async function handle(payload: RunnerRequestPayload): Promise<unknown> {
+async function handle(payload: PanelRequestPayload): Promise<unknown> {
 	switch (payload.type) {
 		case 'session.start': {
 			const handle = await host.manager.create({
@@ -139,7 +138,7 @@ async function handle(payload: RunnerRequestPayload): Promise<unknown> {
 
 async function forwardEvents(sessionId: string): Promise<void> {
 	for await (const event of host.manager.subscribe(sessionId)) {
-		postEvent({ type: 'PAGE_AGENT_V2_RUNNER_EVENT', sessionId, event })
+		postEvent({ type: 'PAGE_AGENT_V2_PANEL_EVENT', sessionId, event })
 		if (event.type === 'session.terminal') break
 	}
 }
@@ -191,7 +190,6 @@ class LazyProviders {
 					apiKey: stored.jevConfig.apiKey,
 				})
 			),
-			thresholds: new SeedThresholdPolicy(),
 			telemetry: 'redacted',
 		})
 		return {
@@ -303,22 +301,22 @@ function normalizeJevModel(config: StoredJevConfig): string {
 }
 
 const providers = new LazyProviders()
-const host = createRunnerHost({
+const host = createPanelRuntime({
 	browser: new ExtensionBrowserRuntime(new ChromeRuntimeRpc()),
 	decisions: new LazyDecisionRouter(providers),
 	taskRouter: new LazyTaskRouter(providers),
 	semanticText: new LazySemanticTextProvider(providers),
 })
 
-function isRunnerRequest(value: unknown): value is {
-	type: 'PAGE_AGENT_V2_RUNNER_REQUEST'
+function isPanelRequest(value: unknown): value is {
+	type: 'PAGE_AGENT_V2_PANEL_REQUEST'
 	requestId: string
-	payload: RunnerRequestPayload
+	payload: PanelRequestPayload
 } {
 	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
 	const candidate = value as Record<string, unknown>
 	return (
-		candidate.type === 'PAGE_AGENT_V2_RUNNER_REQUEST' &&
+		candidate.type === 'PAGE_AGENT_V2_PANEL_REQUEST' &&
 		typeof candidate.requestId === 'string' &&
 		typeof candidate.payload === 'object' &&
 		candidate.payload !== null

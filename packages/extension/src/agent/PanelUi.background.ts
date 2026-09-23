@@ -3,7 +3,7 @@ import type { Capability, PublicSessionEvent } from '@page-agent/protocol'
 import { getSession, upsertSession } from '@/lib/db'
 import { isTrustedExtensionPageSender } from '@/security/ExtensionSender'
 
-import { ensureRunnerTab, runnerGateway, subscribeRunnerEvents } from './RunnerPort.background'
+import { panelGateway, subscribePanelEvents, waitForPanelPort } from './PanelPort.background'
 import { projectSessionEvent } from './SessionProjection'
 import { ACTIVE_UI_SESSION_KEY } from './constants'
 
@@ -29,13 +29,13 @@ interface UiFailure {
 	retryable: boolean
 }
 
-const gateway = runnerGateway()
+const gateway = panelGateway()
 const uiSessions = new Set<string>()
 const bufferedEvents = new Map<string, PublicSessionEvent[]>()
 const historyWrites = new Map<string, Promise<void>>()
 let pendingUiStarts = 0
 
-subscribeRunnerEvents(({ sessionId, event }) => {
+subscribePanelEvents(({ sessionId, event }) => {
 	void routeUiEvent(sessionId, event)
 })
 
@@ -64,7 +64,7 @@ async function routeUiEvent(sessionId: string, event: PublicSessionEvent): Promi
 	}
 }
 
-export async function handleRunnerUiMessage(
+export async function handlePanelUiMessage(
 	message: unknown,
 	sender: chrome.runtime.MessageSender
 ): Promise<UiSuccess | UiFailure> {
@@ -82,7 +82,7 @@ export async function handleRunnerUiMessage(
 			})
 			return { ok: true, sessionId: message.sessionId }
 		} catch (error) {
-			return runnerFailure(error)
+			return panelFailure(error)
 		}
 	}
 	if (message.type === 'PAGE_AGENT_V2_UI_REPLY') {
@@ -95,7 +95,7 @@ export async function handleRunnerUiMessage(
 			})
 			return { ok: true, sessionId: message.sessionId }
 		} catch (error) {
-			return runnerFailure(error)
+			return panelFailure(error)
 		}
 	}
 
@@ -110,15 +110,9 @@ export async function handleRunnerUiMessage(
 			sessionToken: internalToken(),
 			initialTabId,
 		}
-		let created: { sessionId: string }
-		try {
-			created = await gateway.start(input)
-		} catch (error) {
-			const result = runnerFailure(error)
-			if (result.code !== 'RUNNER_UNAVAILABLE') throw error
-			await ensureRunnerTab()
-			created = await gateway.start(input)
-		}
+		if (!(await waitForPanelPort(1_500)))
+			return failure('PANEL_NOT_OPEN', 'Open the Page Agent side panel to run a task', false)
+		const created = await gateway.start(input)
 		uiSessions.add(created.sessionId)
 		await upsertSession({
 			id: created.sessionId,
@@ -131,11 +125,9 @@ export async function handleRunnerUiMessage(
 		flushEvents(created.sessionId)
 		return { ok: true, sessionId: created.sessionId }
 	} catch (error) {
-		const result = runnerFailure(error)
-		if (result.code === 'RUNNER_UNAVAILABLE') {
-			await ensureRunnerTab()
-			return failure('RUNNER_STARTING', 'The extension runner is starting; retry the request', true)
-		}
+		const result = panelFailure(error)
+		if (result.code === 'PANEL_NOT_OPEN')
+			return failure('PANEL_NOT_OPEN', 'Open the Page Agent side panel to run a task', false)
 		return result
 	} finally {
 		pendingUiStarts -= 1
@@ -195,7 +187,7 @@ function queueHistoryWrite(sessionId: string, event: PublicSessionEvent): void {
 			})
 		})
 		.catch((error: unknown) => {
-			console.error('[RunnerUI] Failed to persist session history:', error)
+			console.error('[PanelUI] Failed to persist session history:', error)
 		})
 		.finally(() => {
 			if (historyWrites.get(sessionId) === next) historyWrites.delete(sessionId)
@@ -270,7 +262,7 @@ function internalToken(): string {
 	return `ui-${globalThis.crypto?.randomUUID?.() ?? Date.now()}`
 }
 
-function runnerFailure(error: unknown): UiFailure {
+function panelFailure(error: unknown): UiFailure {
 	const message = error instanceof Error ? error.message : String(error)
 	return failure(message, message, true)
 }

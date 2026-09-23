@@ -1,6 +1,6 @@
 import type { PageObservation, SecretAwareString } from '@page-agent/browser'
 import type { JsonObject, JsonValue } from '@page-agent/protocol'
-import type { DecisionNeed, GoalContract, Session } from '@page-agent/runtime'
+import type { DecisionNeed, GoalContract, ObservationChanges, Session } from '@page-agent/runtime'
 import type {
 	DecisionResult,
 	DecisionRouter,
@@ -14,7 +14,7 @@ import { JevTransportError } from './types'
 import type { JevDecisionResult, JevOption } from './types'
 
 const elementActions = ['click', 'input', 'select'] as const
-// Reserve one Choice option for the explicit "none of the above" transition.
+// The API allows 255 Choice options; reserve one for "none of the above".
 const choiceOptionLimit = 254
 const maxLabelChars = 180
 const maxRecentSelectionsInState = 8
@@ -33,10 +33,13 @@ interface ConcreteCandidate {
 interface RecentSelection {
 	action: string
 	label: string
+	status: 'executed' | 'failed'
 	candidateSignature: string
 	fromUrl: string
 	fromTitle: string
 	fromObservationHash: string
+	fromScrollY?: number
+	viewportHeight?: number
 }
 
 export class JevDecisionRouter implements DecisionRouter {
@@ -57,13 +60,14 @@ export class JevDecisionRouter implements DecisionRouter {
 			session: Session
 			goal: GoalContract
 			observation: PageObservation
+			changes?: ObservationChanges
 			need: DecisionNeed
 		},
 		signal: AbortSignal
 	): Promise<DecisionResult> {
 		if (signal.aborted) return { kind: 'failed', reason: 'CANCELLED' }
 		const history = this.historyFor(input.session, input.goal.goalId)
-		const allCandidates = concreteCandidates(input)
+		const allCandidates = concreteCandidates(input, history)
 		const observationHash = observationStateHash(input.observation)
 		const attempted = new Set(
 			history
@@ -79,14 +83,14 @@ export class JevDecisionRouter implements DecisionRouter {
 			allCandidates.filter((candidate) => attempted.has(candidateSignature(candidate))),
 			history
 		)
-		const choices = candidates.map((candidate) => ({
-			id: candidate.candidateId,
-			label: candidateOption(candidate).label,
-		}))
+		const targetChoices = candidates.map(candidateOption)
 		const diagnostics = {
-			primitive: (candidates.length <= choiceOptionLimit ? 'choice' : 'noul') as 'choice' | 'noul',
+			primitive: (candidates.length <= choiceOptionLimit ? 'choice' : 'noul') as
+				| 'choice'
+				| 'noul',
 			candidateCount: candidates.length,
-			choices,
+			choices: targetChoices,
+			stateBytes: jsonStateBytes(state),
 		}
 		const judgeCompletion = shouldOfferCompletion(history, input.observation)
 		if (input.session.decisionFingerprints?.includes(fingerprint))
@@ -141,12 +145,19 @@ export class JevDecisionRouter implements DecisionRouter {
 			goalSatisfied?: boolean
 			reason?: string
 			failed?: boolean
+			operation?: ConcreteAction
+			targetStrategy?: 'choice' | 'noul' | 'none'
+			requestCount: number
 		}
 		try {
-			selected =
-				candidates.length <= choiceOptionLimit
-					? await this.selectWithChoice(input, candidates, state, judgeCompletion, signal)
-					: await this.selectWithNoul(input, candidates, state, judgeCompletion, signal)
+			selected = await this.selectTransition(
+				input,
+				candidates,
+				targetChoices,
+				state,
+				judgeCompletion,
+				signal
+			)
 		} catch (error) {
 			return {
 				kind: 'failed',
@@ -158,8 +169,19 @@ export class JevDecisionRouter implements DecisionRouter {
 		if (selected.goalSatisfied)
 			return {
 				...this.goalSatisfied(input, fingerprint),
-				diagnostics: { ...diagnostics, selectedTransition: 'complete' },
+				diagnostics: {
+					...diagnostics,
+					requestCount: selected.requestCount,
+					selectedTransition: 'complete',
+				},
 			}
+		const selectionDiagnostics = {
+			...diagnostics,
+			operation: selected.operation,
+			targetStrategy: selected.targetStrategy,
+			requestCount: selected.requestCount,
+			primitive: selected.targetStrategy === 'noul' ? ('noul' as const) : ('choice' as const),
+		}
 
 		if (!selected.candidate)
 			return {
@@ -168,7 +190,7 @@ export class JevDecisionRouter implements DecisionRouter {
 					selected.reason ??
 					`Jev evaluated all ${candidates.length} concrete candidates and found no suitable next action.`,
 				fingerprint,
-				diagnostics: { ...diagnostics, selectedTransition: 'none' },
+				diagnostics: { ...selectionDiagnostics, selectedTransition: 'none' },
 			}
 
 		const candidate = selected.candidate
@@ -177,7 +199,7 @@ export class JevDecisionRouter implements DecisionRouter {
 		return {
 			...decision,
 			diagnostics: {
-				...diagnostics,
+				...selectionDiagnostics,
 				selectedTransition: 'action',
 				selectedOptionId: candidate.candidateId,
 			},
@@ -196,13 +218,24 @@ export class JevDecisionRouter implements DecisionRouter {
 					url: input.observation.page.url,
 					title: input.observation.page.title,
 				},
+				viewport: {
+					scrollY: input.observation.viewport.scrollY,
+					height: input.observation.viewport.height,
+				},
 			},
 		}
 	}
 
-	private async selectWithChoice(
-		input: { observation: PageObservation; need: DecisionNeed },
+	private async selectTransition(
+		input: {
+			session: Session
+			goal: GoalContract
+			observation: PageObservation
+			changes?: ObservationChanges
+			need: DecisionNeed
+		},
 		candidates: ConcreteCandidate[],
+		targetChoices: JevOption[],
 		state: JsonValue,
 		judgeCompletion: boolean,
 		signal: AbortSignal
@@ -211,21 +244,37 @@ export class JevDecisionRouter implements DecisionRouter {
 		goalSatisfied?: boolean
 		reason?: string
 		failed?: boolean
+		operation?: ConcreteAction
+		targetStrategy?: 'choice' | 'noul' | 'none'
+		requestCount: number
 	}> {
-		let results: Record<string, JevDecisionResult>
+		if (candidates.length > choiceOptionLimit) {
+			const [selected, completion] = await Promise.all([
+				this.selectWithNoul(input, candidates, state, signal),
+				judgeCompletion ? this.judgeCompletion(input, state, signal) : Promise.resolve(undefined),
+			])
+			if (completion?.status === 'invalid')
+				return { requestCount: selected.requestCount + 1, failed: true, reason: completion.reason }
+			if (completionProbability(completion) > 0.5)
+				return { requestCount: selected.requestCount + 1, goalSatisfied: true }
+			return {
+				...selected,
+				operation: selected.candidate?.action,
+				requestCount: selected.requestCount + (judgeCompletion ? 1 : 0),
+			}
+		}
 		try {
-			results = await this.provider.decideMany(
+			const results = await this.provider.decideMany(
 				{
 					requestId: this.nextRequestId(input.observation),
 					state,
 					judgments: [
 						{
-							questionId: 'action',
+							questionId: 'transition',
 							need: input.need.kind,
 							risk: input.need.risk,
-							prompt:
-								'Which concrete candidate is the best immediate next step toward the current goal?',
-							options: candidates.map(candidateOption),
+							prompt: 'Which concrete browser action best advances the current goal from this page? Select none only if none of the listed actions is useful. A control already marked pressed=true or checked=true may be turned off by clicking it.',
+							options: targetChoices,
 							allowNone: true,
 						},
 						...(judgeCompletion ? [completionJudgment(input.need)] : []),
@@ -233,51 +282,73 @@ export class JevDecisionRouter implements DecisionRouter {
 				},
 				signal
 			)
+			const completion = results.completion
+			if (completion?.status === 'invalid')
+				return { requestCount: 1, failed: true, reason: completion.reason }
+			if (completionProbability(completion) > 0.5) return { requestCount: 1, goalSatisfied: true }
+			const result = results.transition
+			if (!result || result.status === 'invalid')
+				return { requestCount: 1, failed: true, reason: result?.reason ?? 'Invalid Jev transition' }
+			const candidate = candidates.find((item) => item.candidateId === result.selectedOptionId)
+			if (result.status === 'selected' && !candidate)
+				return { requestCount: 1, failed: true, reason: 'Jev selected an action that was not offered' }
+			return {
+				candidate,
+				operation: candidate?.action,
+				targetStrategy: 'choice',
+				requestCount: 1,
+				reason: candidate ? undefined : result.reason ?? 'Jev found no suitable action',
+			}
 		} catch (error) {
 			if (!isContextLimit(error)) throw error
-			return this.selectWithNoul(input, candidates, state, judgeCompletion, signal)
+			const selected = await this.selectWithNoul(input, candidates, state, signal)
+			const completion = judgeCompletion
+				? await this.judgeCompletion(input, state, signal)
+				: undefined
+			if (completion?.status === 'invalid')
+				return { requestCount: selected.requestCount + 2, failed: true, reason: completion.reason }
+			if (completionProbability(completion) > 0.5)
+				return { requestCount: selected.requestCount + 2, goalSatisfied: true }
+			return {
+				...selected,
+				operation: selected.candidate?.action,
+				requestCount: selected.requestCount + 1 + (judgeCompletion ? 1 : 0),
+			}
 		}
-		const completion = results.completion
-		if (completion?.status === 'invalid')
-			return { failed: true, reason: completion.reason ?? 'Invalid Jev completion judgment' }
-		if (completionProbability(completion) > 0.5) return { goalSatisfied: true }
-		const result = results.action
-		if (result.status === 'invalid')
-			return { failed: true, reason: result.reason ?? 'Invalid Jev decision' }
-		// Choice confidence measures separation from the other valid options. It
-		// must not erase the winner after the runtime has already restricted the
-		// set to visible, enabled and supported concrete actions.
-		const selectedOptionId = result.selectedOptionId ?? result.answer?.selectedOptionId
-		const candidate = candidates.find((item) => item.candidateId === selectedOptionId)
-		return {
-			candidate,
-			reason:
-				result.status === 'none'
-					? (result.reason ?? 'Jev found no suitable action in the current page state')
-					: result.reason,
-		}
+	}
+
+	private async judgeCompletion(
+		input: { observation: PageObservation; need: DecisionNeed },
+		state: JsonValue,
+		signal: AbortSignal
+	): Promise<JevDecisionResult> {
+		return this.provider.decide(
+			{
+				requestId: this.nextRequestId(input.observation),
+				state,
+				...completionJudgment(input.need),
+			},
+			signal
+		)
 	}
 
 	private async selectWithNoul(
 		input: { observation: PageObservation; need: DecisionNeed },
 		candidates: ConcreteCandidate[],
 		state: JsonValue,
-		judgeCompletion: boolean,
 		signal: AbortSignal
 	): Promise<{
 		candidate?: ConcreteCandidate
-		goalSatisfied?: boolean
 		reason?: string
-		failed?: boolean
+		targetStrategy: 'noul'
+		requestCount: number
 	}> {
 		let bestIndex = -1
 		let bestProbability = 0.5
-		const evaluate = async (
-			start: number,
-			end: number,
-			includeCompletion: boolean
-		): Promise<boolean> => {
+		let requestCount = 0
+		const evaluate = async (start: number, end: number): Promise<void> => {
 			try {
+				requestCount += 1
 				const results = await this.provider.decideMany(
 					{
 						requestId: this.nextRequestId(input.observation),
@@ -290,15 +361,10 @@ export class JevDecisionRouter implements DecisionRouter {
 								risk: input.need.risk,
 								prompt: `Is this an appropriate immediate next action toward the current goal: ${candidateOption(candidate).label}?`,
 							})),
-							...(includeCompletion ? [completionJudgment(input.need)] : []),
 						],
 					},
 					signal
 				)
-				const completion = results.completion
-				if (completion?.status === 'invalid')
-					throw new Error(completion.reason ?? 'Invalid Jev completion judgment')
-				if (completionProbability(completion) > 0.5) return true
 				for (let index = start; index < end; index += 1) {
 					const result = results[`candidate:${index}`]
 					if (!result || result.status === 'invalid')
@@ -309,21 +375,20 @@ export class JevDecisionRouter implements DecisionRouter {
 						bestIndex = index
 					}
 				}
-				return false
 			} catch (error) {
 				if (!isContextLimit(error) || end - start <= 1) throw error
 				const middle = start + Math.floor((end - start) / 2)
-				const first = await evaluate(start, middle, includeCompletion)
-				const second = await evaluate(middle, end, false)
-				return first || second
+				await evaluate(start, middle)
+				await evaluate(middle, end)
 			}
 		}
-		const completed = await evaluate(0, candidates.length, judgeCompletion)
-		if (completed) return { goalSatisfied: true }
+		await evaluate(0, candidates.length)
 		return bestIndex >= 0
-			? { candidate: candidates[bestIndex] }
+			? { candidate: candidates[bestIndex], targetStrategy: 'noul', requestCount }
 			: {
 					reason: `Jev evaluated all ${candidates.length} candidates; none exceeded the 0.5 suitability threshold.`,
+					targetStrategy: 'noul',
+					requestCount,
 				}
 	}
 
@@ -338,7 +403,7 @@ export class JevDecisionRouter implements DecisionRouter {
 			const generated = await this.semanticText.generate(
 				{
 					purpose: 'url',
-					request: input.goal.description,
+					request: input.session.plan?.canonicalGoal ?? input.session.task.request,
 					conversation: input.session.conversation ?? [],
 					page: { url: input.observation.page.url, title: input.observation.page.title },
 					actionHistory: history
@@ -374,7 +439,7 @@ export class JevDecisionRouter implements DecisionRouter {
 			const generated = await this.semanticText.generate(
 				{
 					purpose: 'input',
-					request: input.goal.description,
+					request: input.session.plan?.canonicalGoal ?? input.session.task.request,
 					conversation: input.session.conversation ?? [],
 					field: candidate.label,
 					page: { url: input.observation.page.url, title: input.observation.page.title },
@@ -435,10 +500,13 @@ export class JevDecisionRouter implements DecisionRouter {
 				{
 					action: selection.action,
 					label: truncate(selection.label, maxLabelChars),
+					status: entry.status,
 					candidateSignature: selection.candidateSignature,
 					fromUrl: truncate(selection.page.url, 512),
 					fromTitle: truncate(selection.page.title, 512),
 					fromObservationHash: selection.observationSignature,
+					fromScrollY: selection.viewport?.scrollY,
+					viewportHeight: selection.viewport?.height,
 				},
 			]
 		})
@@ -486,7 +554,7 @@ function completionJudgment(need: DecisionNeed): {
 		need: 'judge_outcome',
 		risk: need.risk,
 		prompt:
-			'Do the current page and the recorded executed actions prove that the complete current goal has been achieved?',
+			'Do the current page and the recorded executed actions prove that `currentWorkItem` has been achieved? Judge this work item only; the complete user task may still have later work items.',
 	}
 }
 
@@ -494,11 +562,14 @@ function completionProbability(result: JevDecisionResult | undefined): number {
 	return typeof result?.answer?.value === 'number' ? result.answer.value : 0
 }
 
-function concreteCandidates(input: {
-	session: Session
-	goal: GoalContract
-	observation: PageObservation
-}): ConcreteCandidate[] {
+function concreteCandidates(
+	input: {
+		session: Session
+		goal: GoalContract
+		observation: PageObservation
+	},
+	history: RecentSelection[]
+): ConcreteCandidate[] {
 	const { observation } = input
 	const filledFields = new Set(
 		(input.session.actionJournal ?? [])
@@ -531,7 +602,7 @@ function concreteCandidates(input: {
 	)
 	const candidates = modalCandidates.length > 0 ? modalCandidates : allElementCandidates
 	if (modalCandidates.length === 0) {
-		candidates.push(...scrollCandidates(observation))
+		candidates.push(...scrollCandidates(observation, history))
 		if (input.session.task.allowedCapabilities.includes('tabs.write'))
 			candidates.push({
 				candidateId: `${observation.observationId}:jev:tab.open`,
@@ -549,7 +620,7 @@ function elementCandidates(
 	element: PageObservation['elements'][number]
 ): ConcreteCandidate[] {
 	if (!element.visible || !element.enabled) return []
-	const actions = element.supportedActions ?? legacySupportedActions(element)
+	const actions = element.supportedActions ?? []
 	const candidates: ConcreteCandidate[] = []
 	for (const action of elementActions) {
 		if (!actions.includes(action)) continue
@@ -580,6 +651,8 @@ function elementCandidate(
 	if (element.attributes.href) args.href = element.attributes.href
 	if (element.role) args.role = element.role.toLocaleLowerCase()
 	if (element.state?.selected !== undefined) args.selected = element.state.selected
+	if (element.state?.pressed !== undefined) args.pressed = element.state.pressed
+	if (element.state?.checked !== undefined) args.checked = element.state.checked
 	if (element.state?.expanded !== undefined) args.expanded = element.state.expanded
 	if (element.bounds) {
 		args.x = Math.round(element.bounds.x)
@@ -624,58 +697,121 @@ function elementCandidate(
 	}
 }
 
-function legacySupportedActions(
-	element: PageObservation['elements'][number]
-): (typeof elementActions)[number][] {
-	const actions: (typeof elementActions)[number][] = []
-	if (element.editable) actions.push('input')
-	if (element.tagName === 'select') actions.push('select')
-	if (
-		element.tagName === 'button' ||
-		element.tagName === 'a' ||
-		['button', 'link', 'menuitem', 'option', 'tab', 'combobox'].includes(
-			element.role?.toLocaleLowerCase() ?? ''
-		)
-	)
-		actions.push('click')
-	return actions
-}
-
-function scrollCandidates(observation: PageObservation): ConcreteCandidate[] {
+function scrollCandidates(
+	observation: PageObservation,
+	history: RecentSelection[]
+): ConcreteCandidate[] {
 	const candidates: ConcreteCandidate[] = []
 	const documentHeight = observation.viewport.documentHeight
+	const nearbyControls = observation.metadata?.offViewportControls
+	const nextScrollTargets =
+		nearbyControls && typeof nearbyControls === 'object' && !Array.isArray(nearbyControls)
+			? nearbyControls.nextScrollTargets
+			: undefined
+	const nearest = (direction: 'up' | 'down'): { label: string; distancePx: number } | undefined => {
+		if (!Array.isArray(nextScrollTargets)) return undefined
+		const matches = nextScrollTargets.filter(
+			(item): item is { direction: 'up' | 'down'; label: string; distancePx: number } =>
+				typeof item === 'object' &&
+				item !== null &&
+				!Array.isArray(item) &&
+				item.direction === direction &&
+				typeof item.label === 'string' &&
+				typeof item.distancePx === 'number' &&
+				Number.isFinite(item.distancePx)
+		)
+		return matches.sort((left, right) => left.distancePx - right.distancePx)[0]
+	}
+	const scrollAmount = (target: { distancePx: number } | undefined): number =>
+		target && observation.viewport.height > 0
+			? (Math.max(0, target.distancePx) + Math.max(80, observation.viewport.height / 4)) /
+				observation.viewport.height
+			: 1
+	const seenPositions = history
+		.filter((item) => item.action === 'scroll' && item.fromUrl === observation.page.url)
+		.flatMap((item) => (item.fromScrollY === undefined ? [] : [item.fromScrollY]))
+	const previouslySeen = (targetY: number): boolean =>
+		seenPositions.some(
+			(position) => Math.abs(position - targetY) < Math.max(1, observation.viewport.height / 2)
+		)
 	if (
 		typeof documentHeight === 'number' &&
 		observation.viewport.scrollY + observation.viewport.height < documentHeight - 1
-	)
+	) {
+		const target = nearest('down')
+		const amount = scrollAmount(target)
 		candidates.push({
 			candidateId: `${observation.observationId}:jev:scroll:down`,
 			action: 'scroll',
-			label: 'Scroll down one viewport to observe content below the current viewport',
-			args: { amount: 1, fromScrollY: observation.viewport.scrollY },
+			label: target
+				? `Scroll down to reveal ${truncate(target.label, maxLabelChars)}`
+				: previouslySeen(observation.viewport.scrollY + observation.viewport.height)
+					? 'Scroll down one viewport to return to previously observed content'
+					: 'Scroll down one viewport to observe content below the current viewport',
+			args: {
+				amount,
+				fromScrollY: observation.viewport.scrollY,
+				unobserved: !previouslySeen(observation.viewport.scrollY + observation.viewport.height),
+			},
 		})
-	if (observation.viewport.scrollY > 0)
+	}
+	if (observation.viewport.scrollY > 0) {
+		const target = nearest('up')
+		const amount = scrollAmount(target)
 		candidates.push({
 			candidateId: `${observation.observationId}:jev:scroll:up`,
 			action: 'scroll',
-			label: 'Scroll up one viewport to observe content above the current viewport',
-			args: { amount: -1, fromScrollY: observation.viewport.scrollY },
+			label: target
+				? `Scroll up to reveal ${truncate(target.label, maxLabelChars)}`
+				: previouslySeen(Math.max(0, observation.viewport.scrollY - observation.viewport.height))
+					? 'Scroll up one viewport to return to previously observed content'
+					: 'Scroll up one viewport to observe content above the current viewport',
+			args: {
+				amount: -amount,
+				fromScrollY: observation.viewport.scrollY,
+				unobserved: !previouslySeen(Math.max(0, observation.viewport.scrollY - observation.viewport.height)),
+			},
 		})
+	}
 	return candidates
 }
 
 function decisionState(
-	input: { session: Session; goal: GoalContract; observation: PageObservation },
+	input: {
+		session: Session
+		goal: GoalContract
+		observation: PageObservation
+		changes?: ObservationChanges
+	},
 	attemptedCandidates: ConcreteCandidate[],
 	history: RecentSelection[]
 ): JsonValue {
+	const viewportText = [
+		...new Set((input.observation.content ?? []).map((block) => block.text.trim()).filter(Boolean)),
+	].join('\n')
 	return {
 		originalRequest: input.session.task.request,
 		canonicalGoal: input.session.plan?.canonicalGoal ?? input.goal.description,
-		currentGoal: input.goal.description,
+		currentGoal: input.session.plan?.canonicalGoal ?? input.goal.description,
+		currentWorkItem: input.goal.description,
+		successCriteria:
+			input.session.plan?.workItems.find((item) => item.workItemId === input.goal.goalId)
+				?.successCriteria ?? [],
+		planningHints: input.session.plan?.planningHints ?? [],
+		observedAfterLastAction: input.changes
+			? {
+					afterAction: input.changes.afterAction,
+					controls: input.changes.controls.map((control) => ({ ...control })),
+					viewportChanged: input.changes.viewportChanged,
+					pageChanged: input.changes.pageChanged,
+					...(input.changes.submission ? { submission: input.changes.submission } : {}),
+				}
+			: null,
+		viewportText: truncate(viewportText, 8_000),
 		page: {
 			url: truncate(input.observation.page.url, 512),
 			title: truncate(input.observation.page.title, 512),
+			offViewportControls: input.observation.metadata?.offViewportControls ?? null,
 			viewport: {
 				width: input.observation.viewport.width,
 				height: input.observation.viewport.height,
@@ -697,9 +833,15 @@ function decisionState(
 function candidateOption(candidate: ConcreteCandidate): JevOption {
 	const destination = stringArg(candidate, 'href')
 	const position = numberArg(candidate, 'y')
+	const state = ['selected', 'pressed', 'checked', 'expanded', 'valueState']
+		.flatMap((key) => {
+			const value = candidate.args[key]
+			return typeof value === 'boolean' || typeof value === 'string' ? [`${key}=${value}`] : []
+		})
+		.join(', ')
 	return {
 		id: candidate.candidateId,
-		label: `${candidate.label}${destination ? ` -> ${truncate(destination, 200)}` : ''}${
+		label: `${state ? `[${state}] ` : ''}${candidate.label}${destination ? ` -> ${truncate(destination, 200)}` : ''}${
 			position === undefined ? '' : ` at y=${position}`
 		}`,
 	}
@@ -713,7 +855,8 @@ function candidateSignature(candidate: ConcreteCandidate): string {
 	return shortHash(
 		JSON.stringify({
 			action: candidate.action,
-			label: candidate.label,
+			// Scroll labels describe exploration history and may change without changing the action.
+			label: candidate.action === 'scroll' ? undefined : candidate.label,
 			regionId: candidate.regionId,
 			args: candidate.args,
 		})
@@ -730,6 +873,7 @@ function decisionFingerprint(
 			goal: input.goal.description,
 			page: input.observation.page,
 			viewport: input.observation.viewport,
+			metadata: input.observation.metadata,
 			contentHashes: (input.observation.content ?? []).map((block) => block.contentHash),
 			candidates: candidates.map(candidateSignature),
 		})
@@ -755,12 +899,17 @@ function observationStateHash(observation: PageObservation): string {
 		JSON.stringify({
 			page: observation.page,
 			viewport: observation.viewport,
+			metadata: observation.metadata,
 			content: (observation.content ?? []).map((block) => block.contentHash),
 			elements: observation.elements.map((element) => ({
 				id: element.ref.localId,
 				label: element.accessibleName ?? element.text ?? '',
+				enabled: element.enabled,
+				supportedActions: element.supportedActions,
 				valueState: element.valueState,
 				selected: element.state?.selected,
+				pressed: element.state?.pressed,
+				checked: element.state?.checked,
 				expanded: element.state?.expanded,
 			})),
 		})
@@ -771,7 +920,9 @@ function historyState(history: RecentSelection[]): JsonValue {
 	return history.slice(-maxRecentSelectionsInState).map((item) => ({
 		action: item.action,
 		label: item.label,
+		status: item.status,
 		fromPage: { url: item.fromUrl, title: item.fromTitle },
+		...(item.fromScrollY === undefined ? {} : { fromScrollY: item.fromScrollY }),
 	}))
 }
 
@@ -833,6 +984,7 @@ export class JevTaskRouter implements TaskRouter {
 				risk: 'R0',
 				state: {
 					request: input.session.task.request,
+					freeTextArgumentsAreGeneratedAtExecution: true,
 					missingInputs: input.plan.missingInputs.map((item) => ({
 						key: item.key,
 						question: truncate(item.question, 300),
@@ -844,7 +996,7 @@ export class JevTaskRouter implements TaskRouter {
 					})),
 				},
 				prompt:
-					'Can useful browser execution begin now, with unspecified preferences discovered from pages or resolved using reasonable defaults? Ask only when an answer is strictly required before any productive browser step.',
+					'Can a useful first browser step begin now? Free-text arguments for inputs are generated later by the semantic model. Unspecified preferences do not block navigation or observation. Ask only if no productive first browser step is possible without the user answer.',
 				options: [
 					{
 						id: 'clarification:continue',

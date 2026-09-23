@@ -1,8 +1,6 @@
 import type { ActionName, RiskTier } from '@page-agent/browser'
 import type { JsonValue } from '@page-agent/protocol'
 
-import type { ThresholdPolicy } from './gates'
-import { routeByConfidence } from './gates'
 import { type QuestionTemplate, candidateSelectTemplate } from './questions'
 import { jsonStateBytes } from './transports'
 import type {
@@ -16,7 +14,6 @@ import type {
 export interface JevDecisionProviderConfig {
 	model: string
 	transport: JevTransport
-	thresholds: ThresholdPolicy
 	telemetry: 'off' | 'metadata' | 'redacted'
 	template?: QuestionTemplate
 }
@@ -84,13 +81,12 @@ export class JevDecisionProvider {
 				const answer = response.answers.find(
 					(candidate) => candidate.questionId === question.questionId
 				)
-				return [judgment.questionId, this.routeAnswer(judgment, question, answer)]
+				return [judgment.questionId, this.routeAnswer(question, answer)]
 			})
 		)
 	}
 
 	private routeAnswer(
-		context: Omit<JevDecisionContext, 'state'>,
 		question: ReturnType<QuestionTemplate['build']>,
 		answer: JevDecisionResult['answer']
 	): JevDecisionResult {
@@ -105,21 +101,6 @@ export class JevDecisionProvider {
 			}
 		}
 		const confidence = answer.confidence
-		const threshold = this.config.thresholds.resolve({
-			questionTemplate: question.templateId,
-			risk: context.risk,
-			action: context.action,
-		})
-		const route = routeByConfidence(confidence, threshold)
-		if (route === 'human')
-			return { status: 'escalate', answer, confidence, reason: 'Confidence below human threshold' }
-		if (route === 'none')
-			return {
-				status: 'none',
-				answer,
-				confidence,
-				reason: 'Confidence below verification threshold',
-			}
 		if (answer.selectedOptionId === 'none_of_the_above')
 			return {
 				status: 'none',
@@ -130,7 +111,7 @@ export class JevDecisionProvider {
 		if (!answer.selectedOptionId)
 			return { status: 'invalid', answer, confidence, reason: 'Jev answer has no selected option' }
 		return {
-			status: route === 'verify' ? 'selected' : 'selected',
+			status: 'selected',
 			selectedOptionId: answer.selectedOptionId,
 			answer,
 			confidence,

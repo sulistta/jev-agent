@@ -74,6 +74,96 @@ describe('LocalBrowserRuntime', () => {
 		expect(observation.regions.some((region) => region.kind === 'form')).toBe(true)
 	})
 
+	it('does not draw legacy highlight boxes while observing the document', async () => {
+		const observation = await runtime.observe(request(), new AbortController().signal)
+		expect(observation.elements.length).toBeGreaterThan(0)
+		expect(document.getElementById('playwright-highlight-container')).toBeNull()
+	})
+
+	it('keeps structural interaction indexing when visual highlights are disabled', async () => {
+		await runtime.dispose()
+		document.body.innerHTML =
+			'<div role="button" id="save"><span style="cursor:pointer">Save</span></div>'
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+		const observation = await runtime.observe(request(), new AbortController().signal)
+		expect(observation.elements.filter((element) => element.attributes.id === 'save')).toHaveLength(
+			1
+		)
+		expect(observation.elements).toHaveLength(1)
+		expect(document.getElementById('playwright-highlight-container')).toBeNull()
+	})
+
+	it('observes viewport controls without pulling off-screen controls into the action set', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = '<button id="near">Near</button><button id="far">Far</button>'
+		mockElementLayout()
+		const far = document.querySelector<HTMLElement>('#far')!
+		Object.defineProperty(far, 'getBoundingClientRect', {
+			configurable: true,
+			value: () => ({
+				x: 10,
+				y: window.innerHeight + 500,
+				width: 120,
+				height: 24,
+				top: window.innerHeight + 500,
+				right: 130,
+				bottom: window.innerHeight + 524,
+				left: 10,
+			}),
+		})
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+
+		const viewport = await runtime.observe(
+			{ ...request(), scope: 'viewport' },
+			new AbortController().signal
+		)
+		const documentView = await runtime.observe(request(), new AbortController().signal)
+
+		expect(viewport.elements.map((element) => element.attributes.id)).toEqual(['near'])
+		expect(viewport.metadata?.offViewportControls).toMatchObject({ above: 0, below: 1 })
+		expect(documentView.elements.map((element) => element.attributes.id)).toEqual(['near', 'far'])
+	})
+
+	it('summarizes the next unseen area without sending its controls as action candidates', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = `
+			<button id="near">Visible action</button>
+			<button id="next">Next action</button>
+			<button id="later">Later action</button>
+			<button id="last">Last action</button>
+		`
+		mockElementLayout()
+		for (const [id, offset] of [['next', 440], ['later', 490], ['last', 550]] as const) {
+			const element = document.getElementById(id)!
+			Object.defineProperty(element, 'getBoundingClientRect', {
+				configurable: true,
+				value: () => ({
+					x: 10,
+					y: window.innerHeight + offset,
+					width: 120,
+					height: 24,
+					top: window.innerHeight + offset,
+					right: 130,
+					bottom: window.innerHeight + offset + 24,
+					left: 10,
+				}),
+			})
+		}
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+
+		const viewport = await runtime.observe(
+			{ ...request(), scope: 'viewport' },
+			new AbortController().signal
+		)
+
+		expect(viewport.elements.map((element) => element.attributes.id)).toEqual(['near'])
+		expect(viewport.metadata?.offViewportControls).toMatchObject({
+			below: 3,
+			nextScrollTargets: [{ direction: 'down', label: 'Next action', distancePx: 440 }],
+		})
+	})
+
 	it('uses placeholder text as the semantic name of an unlabelled search field', async () => {
 		await runtime.dispose()
 		document.body.innerHTML = '<input name="search_query" type="text" placeholder="Pesquisar" />'
@@ -182,9 +272,162 @@ describe('LocalBrowserRuntime', () => {
 		})
 	})
 
+	it('observes published text in a custom element but not the editable draft', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = `
+			<div id="editor" contenteditable="true">A published message</div>
+		`
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+
+		const draft = await runtime.observe(request(), new AbortController().signal)
+		expect(draft.content?.some((block) => block.text === 'A published message')).toBe(false)
+
+		document.body.insertAdjacentHTML(
+			'beforeend',
+			'<message-thread><message-body>A published message</message-body></message-thread>'
+		)
+		mockElementLayout()
+		const observed = await runtime.observe(request(), new AbortController().signal)
+		const published = observed.content?.filter((block) => block.text === 'A published message')
+		expect(published).toHaveLength(1)
+		expect(published?.[0]?.tagName).toBe('message-body')
+	})
+
+	it('observes a submit button inserted by the input event, without reusing the old tree', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = '<div id="editor" contenteditable="true" aria-label="Write"></div>'
+		const editor = document.querySelector<HTMLElement>('#editor')!
+		editor.addEventListener('input', () => {
+			if (!document.querySelector('#send'))
+				editor.insertAdjacentHTML('afterend', '<button id="send">Publish</button>')
+		})
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1, interactiveWhitelist: [editor] })
+		const before = await runtime.observe(request(), new AbortController().signal)
+		expect(before.elements.some((item) => item.attributes.id === 'send')).toBe(false)
+		const receipt = await runtime.execute(
+			{
+				actionId: 'write',
+				sessionId,
+				expectedSessionRevision: before.revision,
+				action: {
+					type: 'input',
+					target: before.elements[0].ref,
+					text: 'Message' as SecretAwareString,
+					replace: true,
+				},
+			},
+			new AbortController().signal
+		)
+		const after = await runtime.observe(request(), new AbortController().signal)
+		expect(receipt.status).toBe('executed')
+		const send = after.elements.find((item) => item.attributes.id === 'send')
+		expect(send).toMatchObject({
+			accessibleName: 'Publish',
+			enabled: true,
+		})
+		expect(send?.supportedActions).toContain('click')
+	})
+
+	it('includes a newly created submit control near the viewport after input', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = '<div id="editor" contenteditable="true" aria-label="Write"></div>'
+		const editor = document.querySelector<HTMLElement>('#editor')!
+		mockElementLayout()
+		editor.addEventListener('input', () => {
+			if (document.getElementById('send')) return
+			const send = document.createElement('button')
+			send.id = 'send'
+			send.textContent = 'Publish comment'
+			document.body.append(send)
+			mockElementLayout()
+			const top = window.innerHeight + 40
+			const rect = {
+				x: 10,
+				y: top,
+				top,
+				left: 10,
+				width: 120,
+				height: 24,
+				right: 130,
+				bottom: top + 24,
+			}
+			Object.defineProperty(send, 'getBoundingClientRect', {
+				configurable: true,
+				value: () => rect,
+			})
+			Object.defineProperty(send, 'getClientRects', { configurable: true, value: () => [rect] })
+		})
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+		const before = await runtime.observe(
+			{ ...request(), scope: 'viewport' },
+			new AbortController().signal
+		)
+		const receipt = await runtime.execute(
+			{
+				actionId: 'write',
+				sessionId,
+				expectedSessionRevision: before.revision,
+				action: {
+					type: 'input',
+					target: before.elements.find((element) => element.attributes.id === 'editor')!.ref,
+					text: 'Hello' as SecretAwareString,
+					replace: true,
+				},
+			},
+			new AbortController().signal
+		)
+		const after = await runtime.observe(
+			{ ...request(), scope: 'viewport' },
+			new AbortController().signal
+		)
+		expect(receipt.status).toBe('executed')
+		expect(after.elements.find((element) => element.attributes.id === 'send')).toMatchObject({
+			accessibleName: 'Publish comment',
+			visible: true,
+			enabled: true,
+		})
+		expect(after.metadata?.offViewportControls).toMatchObject({
+			below: 0,
+			nextScrollTargets: [],
+		})
+	})
+
+	it('waits for a delayed actionable control instead of an unrelated DOM mutation', async () => {
+		await runtime.dispose()
+		document.body.innerHTML = '<div id="editor" contenteditable="true">Draft</div>'
+		mockElementLayout()
+		runtime = new LocalBrowserRuntime({ viewportExpansion: -1 })
+		const wait = runtime.waitFor(
+			{
+				sessionId,
+				tabId: 'in-page',
+				since: new Date().toISOString(),
+				expected: [{ type: 'control.changed' }],
+				settle: { quietWindowMs: 10, maxWaitMs: 300 },
+			},
+			new AbortController().signal
+		)
+		document.body.insertAdjacentHTML('beforeend', '<p>Unrelated update</p>')
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		const button = document.createElement('button')
+		button.textContent = 'Send'
+		document.body.append(button)
+		mockElementLayout()
+		const result = await wait
+		expect(result.status).toBe('satisfied')
+		if (result.status === 'error') throw new Error(result.error.message)
+		expect(result.signals).toEqual(
+			expect.arrayContaining([expect.objectContaining({ type: 'control.changed' })])
+		)
+	})
+
 	it('reports an input failure when the page discards the typed value', async () => {
 		const field = document.querySelector<HTMLInputElement>('#query')!
-		field.addEventListener('input', () => { field.value = 'initial' })
+		field.addEventListener('input', () => {
+			field.value = 'initial'
+		})
 		const observation = await runtime.observe(request(), new AbortController().signal)
 		const query = observation.elements.find((element) => element.attributes.id === 'query')!
 

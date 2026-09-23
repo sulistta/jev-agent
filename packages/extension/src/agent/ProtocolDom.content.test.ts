@@ -1,14 +1,22 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-const { execute, showCursor, hideCursor } = vi.hoisted(() => ({
-	execute: vi.fn(async () => ({ status: 'executed' })),
-	showCursor: vi.fn(),
-	hideCursor: vi.fn(),
-}))
+import { initProtocolDomEndpoint } from './ProtocolDom.content'
+
+const { execute, observe, showCursor, hideCursor, updateOverlay, disposeOverlay } = vi.hoisted(
+	() => ({
+		execute: vi.fn(async () => ({ status: 'executed' })),
+		observe: vi.fn(async () => ({ elements: [], viewport: { width: 100, height: 100 } })),
+		showCursor: vi.fn(),
+		hideCursor: vi.fn(),
+		updateOverlay: vi.fn(),
+		disposeOverlay: vi.fn(),
+	})
+)
 
 vi.mock('@page-agent/page-controller', () => ({
 	LocalBrowserRuntime: class {
 		execute = execute
+		observe = observe
 	},
 	SimulatorMask: class {
 		show = showCursor
@@ -16,7 +24,12 @@ vi.mock('@page-agent/page-controller', () => ({
 	},
 }))
 
-import { initProtocolDomEndpoint } from './ProtocolDom.content'
+vi.mock('./ObservationOverlay', () => ({
+	ObservationOverlay: class {
+		update = updateOverlay
+		dispose = disposeOverlay
+	},
+}))
 
 afterEach(() => {
 	vi.unstubAllGlobals()
@@ -26,9 +39,11 @@ afterEach(() => {
 describe('content DOM RPC', () => {
 	it('accepts a targetless scroll addressed to its tab', async () => {
 		let listener:
-			| ((message: unknown, sender: chrome.runtime.MessageSender, respond: (value: unknown) => void) =>
-					| true
-					| undefined)
+			| ((
+					message: unknown,
+					sender: chrome.runtime.MessageSender,
+					respond: (value: unknown) => void
+			  ) => true | undefined)
 			| undefined
 		vi.stubGlobal('chrome', {
 			runtime: {
@@ -63,22 +78,31 @@ describe('content DOM RPC', () => {
 
 		expect(response).toMatchObject({ ok: true, value: { status: 'executed' } })
 		expect(execute).toHaveBeenCalledWith(
-			expect.objectContaining({ tabId: '9191', action: expect.objectContaining({ type: 'scroll' }) }),
+			expect.objectContaining({
+				tabId: '9191',
+				action: expect.objectContaining({ type: 'scroll' }),
+			}),
 			expect.any(AbortSignal)
 		)
-		expect(showCursor).not.toHaveBeenCalled()
+		expect(showCursor).toHaveBeenCalledOnce()
 	})
 
-	it('shows the visual cursor for a click and hides it after execution', async () => {
+	it('keeps the visual cursor through actions and clears it at session completion', async () => {
 		let listener:
-			| ((message: unknown, sender: chrome.runtime.MessageSender, respond: (value: unknown) => void) =>
-					| true
-					| undefined)
+			| ((
+					message: unknown,
+					sender: chrome.runtime.MessageSender,
+					respond: (value: unknown) => void
+			  ) => true | undefined)
 			| undefined
 		vi.stubGlobal('chrome', {
 			runtime: {
 				sendMessage: vi.fn(async () => undefined),
-				onMessage: { addListener: vi.fn((callback) => { listener = callback }) },
+				onMessage: {
+					addListener: vi.fn((callback) => {
+						listener = callback
+					}),
+				},
 			},
 		})
 		initProtocolDomEndpoint()
@@ -101,8 +125,59 @@ describe('content DOM RPC', () => {
 				resolve
 			)
 		})
-		await vi.waitFor(() => expect(hideCursor).toHaveBeenCalledOnce())
 		expect(showCursor).toHaveBeenCalledOnce()
 		expect(showCursor.mock.invocationCallOrder[0]).toBeLessThan(execute.mock.invocationCallOrder[0])
+		expect(hideCursor).not.toHaveBeenCalled()
+		listener?.(
+			{ type: 'PAGE_AGENT_V2_VISUAL_END', sessionId: 'session-1' },
+			{} as chrome.runtime.MessageSender,
+			vi.fn()
+		)
+		expect(hideCursor).toHaveBeenCalledOnce()
+	})
+
+	it('updates one persistent candidate overlay on observation', async () => {
+		let listener:
+			| ((
+					message: unknown,
+					sender: chrome.runtime.MessageSender,
+					respond: (value: unknown) => void
+			  ) => true | undefined)
+			| undefined
+		vi.stubGlobal('chrome', {
+			runtime: {
+				sendMessage: vi.fn(async () => undefined),
+				onMessage: {
+					addListener: vi.fn((callback) => {
+						listener = callback
+					}),
+				},
+			},
+		})
+		initProtocolDomEndpoint()
+		await new Promise<unknown>((resolve) => {
+			listener?.(
+				{
+					type: 'PAGE_AGENT_V2_DOM',
+					tabId: '9191',
+					payload: {
+						type: 'dom.observe',
+						requestId: 'observe-1',
+						sessionId: 'session-1',
+						tabId: '9191',
+					},
+				},
+				{} as chrome.runtime.MessageSender,
+				resolve
+			)
+		})
+		expect(showCursor).toHaveBeenCalledOnce()
+		expect(updateOverlay).toHaveBeenCalledOnce()
+		listener?.(
+			{ type: 'PAGE_AGENT_V2_VISUAL_END', sessionId: 'session-1' },
+			{} as chrome.runtime.MessageSender,
+			vi.fn()
+		)
+		expect(disposeOverlay).toHaveBeenCalledOnce()
 	})
 })

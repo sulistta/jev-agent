@@ -9,6 +9,8 @@ import { LocalBrowserRuntime, SimulatorMask } from '@page-agent/page-controller'
 import type { ContentDocumentHello, DomRpcRequest, WireDomError } from '@page-agent/protocol'
 import { PROTOCOL_VERSION } from '@page-agent/protocol'
 
+import { ObservationOverlay } from './ObservationOverlay'
+
 export interface DomRpcSuccess {
 	ok: true
 	value: unknown
@@ -27,6 +29,15 @@ export function initProtocolDomEndpoint(): void {
 	let runtime: LocalBrowserRuntime | undefined
 	let runtimeTabId: string | undefined
 	let visualCursor: SimulatorMask | undefined
+	let visualOverlay: ObservationOverlay | undefined
+	let visualSessionId: string | undefined
+	const endVisualSession = (sessionId: string) => {
+		if (sessionId !== visualSessionId) return
+		visualCursor?.hide()
+		visualOverlay?.dispose()
+		visualOverlay = undefined
+		visualSessionId = undefined
+	}
 	void chrome.runtime.sendMessage({
 		type: 'PAGE_AGENT_V2_CONTENT_HELLO',
 		payload: {
@@ -40,6 +51,10 @@ export function initProtocolDomEndpoint(): void {
 	})
 
 	chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
+		if (isVisualEndMessage(message)) {
+			endVisualSession(message.sessionId)
+			return
+		}
 		if (!isDomForwardMessage(message)) return
 
 		const requestTabId = domRequestTabId(message.payload)
@@ -60,22 +75,42 @@ export function initProtocolDomEndpoint(): void {
 			runtimeTabId = tabId
 		}
 
-		const showCursor =
-			message.payload.type === 'dom.execute' &&
-			typeof message.payload.action.type === 'string' &&
-			['click', 'input', 'select', 'focus'].includes(message.payload.action.type)
-		if (showCursor) {
+		if (visualSessionId !== message.payload.sessionId) {
+			if (visualSessionId) endVisualSession(visualSessionId)
+			visualSessionId = message.payload.sessionId
+		}
+		if (message.payload.type === 'dom.observe' || message.payload.type === 'dom.execute') {
 			visualCursor ??= new SimulatorMask({ visualOnly: true })
 			visualCursor.show()
 		}
 		handleDomRequest(runtime, runtimeTabId!, message.payload)
-			.then((value) => sendResponse({ ok: true, value } satisfies DomRpcSuccess))
-			.catch((error: unknown) => sendResponse(toFailure(error)))
-			.finally(() => {
-				if (showCursor) visualCursor?.hide()
+			.then((value) => {
+				if (
+					message.payload.type === 'dom.observe' &&
+					visualSessionId === message.payload.sessionId
+				) {
+					visualOverlay ??= new ObservationOverlay()
+					visualOverlay.update(value as Awaited<ReturnType<LocalBrowserRuntime['observe']>>)
+				}
+				sendResponse({ ok: true, value } satisfies DomRpcSuccess)
 			})
+			.catch((error: unknown) => sendResponse(toFailure(error)))
 		return true
 	})
+}
+
+function isVisualEndMessage(value: unknown): value is {
+	type: 'PAGE_AGENT_V2_VISUAL_END'
+	sessionId: string
+} {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'type' in value &&
+		value.type === 'PAGE_AGENT_V2_VISUAL_END' &&
+		'sessionId' in value &&
+		typeof value.sessionId === 'string'
+	)
 }
 
 async function handleDomRequest(

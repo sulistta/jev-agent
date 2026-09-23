@@ -1,4 +1,5 @@
 export * from './AgentRuntime'
+export * from './observationChanges'
 export * from './domain'
 export * from './errors/RuntimeError'
 export * from './ports'

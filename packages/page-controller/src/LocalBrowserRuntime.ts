@@ -44,6 +44,8 @@ interface ElementRecord {
 }
 
 let runtimeCounter = 0
+// Match the Page Agent controller's nearby interaction range without reading the full page.
+const actionViewportMarginPx = 400
 
 function nextId(prefix: string): string {
 	runtimeCounter += 1
@@ -81,10 +83,10 @@ function elementMatchesObservationScope(
 		return (request.regionIds ?? []).includes(`region:${regionKind(element)}`)
 	const bounds = element.getBoundingClientRect()
 	return (
-		bounds.bottom >= 0 &&
-		bounds.right >= 0 &&
-		bounds.top <= window.innerHeight &&
-		bounds.left <= window.innerWidth
+		bounds.bottom >= -actionViewportMarginPx &&
+		bounds.right >= -actionViewportMarginPx &&
+		bounds.top <= window.innerHeight + actionViewportMarginPx &&
+		bounds.left <= window.innerWidth + actionViewportMarginPx
 	)
 }
 
@@ -94,11 +96,33 @@ function collectContentBlocks(
 	if (request.scope === 'targets') return []
 	const seen = new Set<string>()
 	const blocks: NonNullable<PageObservation['content']> = []
-	const elements = document.querySelectorAll<HTMLElement>(
-		'h1, h2, h3, h4, h5, h6, p, li, dt, dd, td, th, figcaption, blockquote'
+	const semanticSelector = 'h1, h2, h3, h4, h5, h6, p, li, dt, dd, td, th, figcaption, blockquote'
+	const elements = new Set<HTMLElement>(document.querySelectorAll<HTMLElement>(semanticSelector))
+	// Web components often render published text in a custom leaf element instead of
+	// a paragraph. Read those leaves too, without copying whole component subtrees.
+	const textNodes = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+	while (textNodes.nextNode()) {
+		const parent = textNodes.currentNode.parentElement
+		if (!parent || !textNodes.currentNode.textContent?.trim()) continue
+		if (
+			parent.closest(
+				`${semanticSelector}, [contenteditable], button, a, input, textarea, select, script, style, noscript, template, [hidden], [aria-hidden="true"]`
+			)
+		)
+			continue
+		let custom: HTMLElement | null = parent
+		while (custom && custom !== document.body && !custom.localName.includes('-'))
+			custom = custom.parentElement
+		if (!custom || custom === document.body || custom.querySelector(semanticSelector)) continue
+		if (custom.innerText.length > 1_000) continue
+		elements.add(custom)
+	}
+	const ordered = [...elements].sort((left, right) =>
+		left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
 	)
-	for (const element of elements) {
+	for (const element of ordered) {
 		if (blocks.length >= 200 || !isVisible(element) || sensitivity(element) === 'secret') continue
+		if (element.closest('[contenteditable="true"]')) continue
 		if (!elementMatchesContentScope(element, request)) continue
 		const text = element.innerText.replace(/\s+/g, ' ').trim().slice(0, 1_000)
 		if (text.length < 2 || seen.has(text)) continue
@@ -139,6 +163,7 @@ function shortHash(value: string): string {
 }
 
 function isEnabled(element: HTMLElement): boolean {
+	if (element.getAttribute('aria-disabled') === 'true') return false
 	return (
 		!(
 			element instanceof HTMLButtonElement ||
@@ -381,7 +406,13 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 		this.revision += 1
 		const observationId = nextId('observation')
 		const timestamp = now()
-		const tree = getFlatTree({ ...this.config, highlightOpacity: 0 })
+		const tree = getFlatTree({
+			...this.config,
+			doHighlightElements: false,
+			// Discover controls throughout the DOM, but return only the requested
+			// scope and the nearby action margin. Distant controls are summarized below.
+			viewportExpansion: -1,
+		})
 		const selectorMap = getSelectorMap(tree)
 		const candidates: [number, HTMLElement][] =
 			selectorMap.size > 0
@@ -400,10 +431,43 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 			{ kind: ReturnType<typeof regionKind>; elementIds: string[] }
 		>()
 		let secretFieldsRemoved = 0
+		const offViewportControls = {
+			above: 0,
+			below: 0,
+			nextScrollTargets: [] as { direction: 'up' | 'down'; label: string; distancePx: number }[],
+		}
 
 		for (const [index, element] of candidates) {
 			const localId = `index:${index}`
-			if (!elementMatchesObservationScope(element, localId, request)) continue
+			if (!elementMatchesObservationScope(element, localId, request)) {
+				if (request.scope === 'viewport' && isVisible(element) && isEnabled(element)) {
+					const bounds = element.getBoundingClientRect()
+					if (supportedActionsFor(element).includes('click')) {
+						const direction =
+							bounds.bottom < 0 ? 'up' : bounds.top > window.innerHeight ? 'down' : undefined
+						if (direction) {
+							offViewportControls[direction === 'up' ? 'above' : 'below'] += 1
+							const distancePx = Math.round(
+								direction === 'up' ? -bounds.bottom : bounds.top - window.innerHeight
+							)
+							if (distancePx <= window.innerHeight && sensitivity(element) === 'public') {
+								const target: (typeof offViewportControls.nextScrollTargets)[number] = {
+									direction,
+									label: accessibleName(element).slice(0, 180) || element.tagName.toLowerCase(),
+									distancePx,
+								}
+								const existing = offViewportControls.nextScrollTargets.findIndex(
+									(item) => item.direction === direction
+								)
+								if (existing < 0) offViewportControls.nextScrollTargets.push(target)
+								else if (distancePx < offViewportControls.nextScrollTargets[existing].distancePx)
+									offViewportControls.nextScrollTargets[existing] = target
+							}
+						}
+					}
+				}
+				continue
+			}
 			const ref: ElementRef = {
 				kind: 'element',
 				sessionId: request.sessionId,
@@ -492,6 +556,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 						: undefined,
 			})
 		}
+		offViewportControls.nextScrollTargets.sort((left, right) => left.distancePx - right.distancePx)
 		const content = request.includeNonInteractive ? collectContentBlocks(request) : []
 
 		return {
@@ -523,6 +588,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 			})),
 			elements,
 			content,
+			metadata: { offViewportControls },
 			signals: [],
 			sanitization: {
 				policyId: request.sensitivityPolicyId,
@@ -664,6 +730,9 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 
 		return new Promise((resolve) => {
 			const signals: BrowserSignal[] = [...recentSignals]
+			let actionableControls = request.expected.some((change) => change.type === 'control.changed')
+				? actionableControlSnapshot()
+				: undefined
 			let settleTimer: ReturnType<typeof setTimeout> | undefined
 			let finished = false
 			let expectedObserved = recentSignals.length > 0
@@ -719,6 +788,21 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 					: new MutationObserver(() => {
 							const mutation = signalEvent('dom.mutated', { relevant: true })
 							const mutationSignals = [mutation]
+							if (actionableControls) {
+								const previous = actionableControls
+								const current = actionableControlSnapshot()
+								if (
+									[...current].some(
+										([element, state]) =>
+											state.enabled &&
+											(!previous.has(element) ||
+												!previous.get(element)?.enabled ||
+												previous.get(element)?.label !== state.label)
+									)
+								)
+									mutationSignals.push(signalEvent('control.changed', {}))
+								actionableControls = current
+							}
 							for (const [localId, record] of this.records) {
 								if (
 									record.element instanceof HTMLInputElement ||
@@ -810,10 +894,7 @@ export class LocalBrowserRuntime implements BrowserRuntime {
 				return { effect: { type: 'element.updated', ref: action.target } as const }
 			case 'input':
 				await inputTextElement(requiredTarget(target), action.text)
-				if (
-					!target?.isConnected ||
-					valueSnapshot(target).trim() !== action.text.trim()
-				) {
+				if (!target?.isConnected || valueSnapshot(target).trim() !== action.text.trim()) {
 					throw new Error('INPUT_NOT_APPLIED')
 				}
 				return { effect: { type: 'element.updated', ref: action.target } as const }
@@ -918,8 +999,21 @@ function expectedSatisfied(
 	})
 }
 
+function actionableControlSnapshot(): Map<HTMLElement, { enabled: boolean; label: string }> {
+	const controls = document.querySelectorAll<HTMLElement>(
+		'button, a, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"]'
+	)
+	return new Map(
+		Array.from(controls)
+			.filter(isVisible)
+			.map((element) => [element, { enabled: isEnabled(element), label: accessibleName(element) }])
+	)
+}
+
 function signalMatches(expected: ExpectedChange, signal: BrowserSignal): boolean {
 	switch (expected.type) {
+		case 'control.changed':
+			return signal.type === 'control.changed'
 		case 'dom':
 			return signal.type === 'dom.mutated'
 		case 'target.value':

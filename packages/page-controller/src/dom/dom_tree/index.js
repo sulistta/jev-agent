@@ -1451,8 +1451,8 @@ export default (
 					} else {
 						highlightElement(node, nodeData.highlightIndex, parentIframe)
 					}
-					return true // Successfully highlighted
 				}
+				return true // Indexed as an interaction, whether or not visuals are drawn.
 			} else {
 				// console.log(`Skipping highlight for ${nodeData.tagName} (outside viewport)`);
 			}

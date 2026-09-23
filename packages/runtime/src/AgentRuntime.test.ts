@@ -106,6 +106,392 @@ function dependencies(verifier: RuntimeDependencies['verifier']): RuntimeDepende
 }
 
 describe('AgentRuntime', () => {
+	it('passes a post-input button to the next decision and requires publication evidence', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.semanticText = {
+			plan: async () => ({
+				version: 1 as const,
+				canonicalGoal: 'Write and publish a message',
+				originalLanguage: 'en',
+				missingInputs: [],
+				workItems: [
+					{
+						workItemId: 'publish',
+						description: 'Write and publish a message',
+						kind: 'interact' as const,
+						required: true,
+						dependsOn: [],
+						status: 'pending' as const,
+					},
+				],
+				coverage: [],
+				deliverable: 'Published message',
+				externalActions: ['Publish the message'],
+			}),
+			generate: async () => ({ text: 'Done' }),
+		}
+		const editor = {
+			ref,
+			tagName: 'div',
+			accessibleName: 'Write',
+			visible: true,
+			enabled: true,
+			editable: true,
+			attributes: { id: 'editor' },
+			sensitivity: 'public' as const,
+			supportedActions: ['input' as const],
+			valueState: 'empty' as const,
+		}
+		const button = {
+			...editor,
+			ref: { ...ref, localId: 'index:1' },
+			tagName: 'button',
+			accessibleName: 'Publish',
+			editable: false,
+			attributes: { id: 'publish' },
+			supportedActions: ['click' as const],
+			valueState: undefined,
+		}
+		let observed = 0
+		deps.browser.observe = vi.fn(async () => {
+			const index = observed++
+			return {
+				...observation(index + 1),
+				elements:
+					index === 0
+						? [editor]
+						: [index === 1 ? { ...editor, valueState: 'present' as const } : editor, button],
+				content:
+					index >= 2 ? [{ blockId: 'posted', contentHash: 'posted', text: 'Hello there' }] : [],
+			}
+		})
+		let calls = 0
+		deps.decisions.decide = vi.fn(async ({ changes }) => {
+			if (calls++ === 0)
+				return {
+					kind: 'action' as const,
+					action: {
+						type: 'input' as const,
+						target: ref,
+						text: 'Hello there' as import('@page-agent/browser').SecretAwareString,
+						replace: true,
+					},
+				}
+			if (calls === 2) {
+				expect(changes?.controls).toMatchObject([{ label: 'Publish', change: 'appeared' }])
+				expect(changes?.submission).toBe('draft')
+				return { kind: 'action' as const, action: { type: 'click' as const, target: button.ref } }
+			}
+			expect(changes?.submission).toBe('published')
+			return { kind: 'goal_satisfied' as const }
+		})
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Write and publish a message',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(3)
+	})
+
+	it('does not claim publication when text remains only in the editor', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		deps.browser.observe = vi.fn(async () => ({
+			...observation(1),
+			elements: [
+				{
+					ref,
+					tagName: 'div',
+					visible: true,
+					enabled: true,
+					editable: true,
+					attributes: { id: 'editor' },
+					sensitivity: 'public' as const,
+					supportedActions: ['input' as const],
+				},
+			],
+		}))
+		deps.semanticText = {
+			plan: async () => ({
+				version: 1 as const,
+				canonicalGoal: 'Publish message',
+				originalLanguage: 'en',
+				missingInputs: [],
+				workItems: [
+					{
+						workItemId: 'publish',
+						description: 'Publish message',
+						kind: 'interact' as const,
+						required: true,
+						dependsOn: [],
+						status: 'pending' as const,
+					},
+				],
+				coverage: [],
+				deliverable: 'Published',
+				externalActions: ['Publish message'],
+			}),
+			generate: async () => ({ text: 'Done' }),
+		}
+		let count = 0
+		deps.decisions.decide = vi.fn(async () =>
+			count++ === 0
+				? {
+						kind: 'action' as const,
+						action: {
+							type: 'input' as const,
+							target: ref,
+							text: 'Hello' as import('@page-agent/browser').SecretAwareString,
+							replace: true,
+						},
+					}
+				: { kind: 'goal_satisfied' as const }
+		)
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Publish message',
+			owner: { kind: 'in_page', ownerId: 'test' },
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'blocked' })
+		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledTimes(1)
+	})
+
+	it('reobserves once when a control appears after the first post-input observation', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		const waitFor = deps.browser.waitFor.bind(deps.browser)
+		deps.browser.waitFor = vi.fn((request, signal) => waitFor(request, signal))
+		const input = { ...ref, localId: 'index:0' }
+		const button = { ...ref, localId: 'index:1' }
+		const field = {
+			ref: input,
+			tagName: 'input',
+			accessibleName: 'Message',
+			visible: true,
+			enabled: true,
+			editable: true,
+			attributes: { id: 'message' },
+			sensitivity: 'public' as const,
+			supportedActions: ['input' as const],
+			valueState: 'empty' as const,
+		}
+		const submit = {
+			ref: button,
+			tagName: 'button',
+			accessibleName: 'Send',
+			visible: true,
+			enabled: true,
+			editable: false,
+			attributes: { id: 'send' },
+			sensitivity: 'public' as const,
+			supportedActions: ['click' as const],
+		}
+		let observed = 0
+		deps.browser.observe = vi.fn(async () => {
+			const index = observed++
+			return { ...observation(index + 1), elements: index >= 2 ? [field, submit] : [field] }
+		})
+		let decisions = 0
+		deps.decisions.decide = vi.fn(async ({ changes }) => {
+			const index = decisions++
+			if (index === 0)
+				return {
+					kind: 'action' as const,
+					action: {
+						type: 'input' as const,
+						target: input,
+						text: 'Hello' as import('@page-agent/browser').SecretAwareString,
+						replace: true,
+					},
+				}
+			if (index === 1) return { kind: 'blocked' as const, reason: 'No control yet' }
+			if (index === 2) {
+				expect(changes?.controls).toMatchObject([{ label: 'Send', change: 'appeared' }])
+				return { kind: 'action' as const, action: { type: 'click' as const, target: button } }
+			}
+			return { kind: 'goal_satisfied' as const }
+		})
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Send a message',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'send',
+					description: 'Send a message',
+					required: true,
+					outcome: { kind: 'predicate', predicate: { kind: 'runtime.managed' } },
+					status: 'pending',
+					evidenceIds: [],
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.browser, 'waitFor')).toHaveBeenCalledTimes(3)
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(4)
+	})
+
+	it('stops after one bounded recovery when input reveals no new control', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		const waitFor = deps.browser.waitFor.bind(deps.browser)
+		deps.browser.waitFor = vi.fn((request, signal) => waitFor(request, signal))
+		let revision = 0
+		deps.browser.observe = vi.fn(async () => observation(++revision))
+		let calls = 0
+		deps.decisions.decide = vi.fn(async () =>
+			calls++ === 0
+				? {
+						kind: 'action' as const,
+						action: {
+							type: 'input' as const,
+							target: ref,
+							text: 'Hello' as import('@page-agent/browser').SecretAwareString,
+							replace: true,
+						},
+					}
+				: { kind: 'blocked' as const, reason: 'No suitable action' }
+		)
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Enter text',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'input',
+					description: 'Enter text',
+					required: true,
+					outcome: { kind: 'predicate', predicate: { kind: 'runtime.managed' } },
+					status: 'pending',
+					evidenceIds: [],
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'blocked' })
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(2)
+		expect(Reflect.get(deps.browser, 'waitFor')).toHaveBeenCalledTimes(2)
+	})
+
+	it('rejudges when only an off-viewport control appears after input', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		let observed = 0
+		deps.browser.observe = vi.fn(async () => {
+			const index = observed++
+			return {
+				...observation(index + 1),
+				metadata: {
+					offViewportControls: {
+						above: 0,
+						below: index >= 2 ? 1 : 0,
+						nextScrollTargets:
+							index >= 2 ? [{ direction: 'down', label: 'Publish', distancePx: 40 }] : [],
+					},
+				},
+			}
+		})
+		let decisions = 0
+		deps.decisions.decide = vi.fn(async ({ observation: current }) => {
+			const index = decisions++
+			if (index === 0)
+				return {
+					kind: 'action' as const,
+					action: {
+						type: 'input' as const,
+						target: ref,
+						text: 'Hello' as import('@page-agent/browser').SecretAwareString,
+						replace: true,
+					},
+				}
+			if (index === 1) return { kind: 'blocked' as const, reason: 'No control yet' }
+			expect(current.metadata?.offViewportControls).toMatchObject({ below: 1 })
+			return { kind: 'goal_satisfied' as const }
+		})
+		const handle = await createAgentRuntime(deps).start({
+			request: 'Enter text',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'task',
+					description: 'Enter text',
+					required: true,
+					outcome: { kind: 'predicate', predicate: { kind: 'runtime.managed' } },
+					status: 'pending',
+					evidenceIds: [],
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
+		expect(Reflect.get(deps.decisions, 'decide')).toHaveBeenCalledTimes(3)
+	})
+
+	it('does not execute the same possible submit click twice without publication evidence', async () => {
+		const deps = dependencies({
+			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
+		})
+		let observed = 0
+		deps.browser.observe = vi.fn(async () => ({
+			...observation(++observed),
+			elements: [
+				{
+					ref,
+					tagName: 'div',
+					visible: true,
+					enabled: true,
+					editable: true,
+					attributes: { id: 'editor' },
+					sensitivity: 'public' as const,
+					supportedActions: ['input' as const],
+				},
+			],
+			content: [],
+		}))
+		const selection = {
+			action: 'click',
+			label: 'Send',
+			candidateSignature: 'send-button',
+			observationSignature: 'state',
+			page: { url: 'https://example.test/', title: 'Test' },
+		}
+		let decisions = 0
+		deps.decisions.decide = vi.fn(async () =>
+			decisions++ === 0
+				? {
+						kind: 'action' as const,
+						action: {
+							type: 'input' as const,
+							target: ref,
+							text: 'Hello' as import('@page-agent/browser').SecretAwareString,
+							replace: true,
+						},
+					}
+				: { kind: 'action' as const, action: { type: 'click' as const, target: ref }, selection }
+		)
+		const runtime = createAgentRuntime(deps)
+		const handle = await runtime.start({
+			request: 'Send a message',
+			owner: { kind: 'in_page', ownerId: 'test' },
+			goals: [
+				{
+					goalId: 'send',
+					description: 'Send a message',
+					required: true,
+					outcome: { kind: 'predicate', predicate: { kind: 'runtime.managed' } },
+					status: 'pending',
+					evidenceIds: [],
+				},
+			],
+		})
+		await expect(handle.result).resolves.toMatchObject({ status: 'blocked' })
+		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledTimes(2)
+	})
 	it('executes a semantic locate-identify-act plan as one complete operational goal', async () => {
 		const deps = dependencies({
 			verify: vi.fn(async () => ({ status: 'inconclusive' as const, evidence: [] })),
@@ -463,7 +849,10 @@ describe('AgentRuntime', () => {
 		await expect(handle.result).resolves.toMatchObject({ status: 'completed' })
 		expect(Reflect.get(deps.browser, 'waitFor')).not.toHaveBeenCalled()
 		expect(Reflect.get(deps.browser, 'execute')).toHaveBeenCalledWith(
-			expect.objectContaining({ tabId: 'in-page', action: expect.objectContaining({ type: 'scroll' }) }),
+			expect.objectContaining({
+				tabId: 'in-page',
+				action: expect.objectContaining({ type: 'scroll' }),
+			}),
 			expect.any(AbortSignal)
 		)
 	})

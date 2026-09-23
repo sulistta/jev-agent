@@ -17,6 +17,10 @@ export function compileTaskPlan(plan: TaskPlan): TaskPlan {
 			dependsOn: item.dependsOn.filter((dependency) => researchIds.has(dependency)),
 		}))
 	const operationalSources = plan.workItems.filter((item) => item.kind !== 'research')
+	const planningHints = operationalSources.map((item) => ({
+		description: item.description,
+		successCriteria: item.successCriteria ?? [],
+	}))
 	if (operationalSources.length === 0)
 		return {
 			...plan,
@@ -38,14 +42,14 @@ export function compileTaskPlan(plan: TaskPlan): TaskPlan {
 			operationalSources.some((item) => item.kind === 'interact') || plan.externalActions.length > 0
 				? 'interact'
 				: 'navigate',
-		required:
-			operationalSources.some((item) => item.required) || plan.externalActions.length > 0,
+		required: operationalSources.some((item) => item.required) || plan.externalActions.length > 0,
 		dependsOn: researchItems.filter((item) => item.required).map((item) => item.workItemId),
 		status: 'pending',
 	}
 
 	return {
 		...plan,
+		planningHints,
 		workItems: [...researchItems, operationalItem],
 		coverage: plan.coverage.filter((requirement) => researchIds.has(requirement.workItemId)),
 	}

@@ -28,4 +28,24 @@ describe('DecisionCard', () => {
 		expect(html).toContain('click Subscribe')
 		expect(html).toContain('click Like')
 	})
+
+	it('shows a single collapsed group of concrete actions', () => {
+		const html = renderToStaticMarkup(
+			createElement(EventCard, {
+				event: {
+					type: 'decision',
+					kind: 'action',
+					selectedLabel: 'click Publish',
+					selectedOptionId: 'button-2',
+					candidateCount: 2,
+					choices: [
+						{ id: 'button-1', label: 'Save' },
+						{ id: 'button-2', label: 'Publish' },
+					],
+				},
+			})
+		)
+		expect(html).toContain('Choices considered (2)')
+		expect(html.match(/<details/g)).toHaveLength(1)
+	})
 })

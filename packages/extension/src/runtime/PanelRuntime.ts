@@ -24,7 +24,7 @@ import {
 import { IndexedDbEventLog } from './IndexedDbEventLog'
 import { IndexedDbSessionStore } from './IndexedDbSessionStore'
 
-export interface RunnerHostConfig {
+export interface PanelRuntimeConfig {
 	browser: BrowserRuntime
 	decisions: DecisionRouter
 	taskRouter: TaskRouter
@@ -37,7 +37,7 @@ export interface RunnerHostConfig {
 	ids?: IdGenerator
 }
 
-export interface RunnerHost {
+export interface PanelRuntime {
 	runtime: AgentRuntime
 	sessions: SessionStore
 	events: SessionEventLog
@@ -45,10 +45,10 @@ export interface RunnerHost {
 }
 
 /**
- * Creates the long-lived runner composition. The service worker and UI talk to
- * this host; neither owns session state or the execution loop.
+ * Creates the side-panel execution composition. The service worker proxies
+ * browser operations while the panel owns the execution loop.
  */
-export function createRunnerHost(config: RunnerHostConfig): RunnerHost {
+export function createPanelRuntime(config: PanelRuntimeConfig): PanelRuntime {
 	const sessions = config.sessions ?? new IndexedDbSessionStore()
 	const events = config.events ?? new IndexedDbEventLog()
 	const clock = config.clock ?? systemClock

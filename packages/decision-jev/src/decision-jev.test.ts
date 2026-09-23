@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { JevDecisionProvider } from './JevDecisionProvider'
-import { SeedThresholdPolicy, routeByConfidence } from './gates'
 import { QuestionTemplateRegistry, candidateSelectTemplate } from './questions'
 import { DirectHttpJevTransport, MockJevTransport, RetryingJevTransport } from './transports'
 import { JevTransportError } from './types'
@@ -29,7 +28,7 @@ describe('@page-agent/decision-jev', () => {
 		expect(() => registry.register(candidateSelectTemplate)).toThrow('Duplicate')
 	})
 
-	it('routes Jev selection through confidence gates and safe none option', async () => {
+	it('keeps the Choice winner regardless of distribution confidence and preserves safe none', async () => {
 		const transport = new MockJevTransport({
 			requestId: 'request-1',
 			answers: [
@@ -39,7 +38,6 @@ describe('@page-agent/decision-jev', () => {
 		const provider = new JevDecisionProvider({
 			model: 'jev-test',
 			transport,
-			thresholds: new SeedThresholdPolicy(),
 			telemetry: 'metadata',
 		})
 		expect(await provider.decide(requestContext, new AbortController().signal)).toMatchObject({
@@ -54,21 +52,18 @@ describe('@page-agent/decision-jev', () => {
 				answers: [
 					{
 						questionId: 'candidate.select',
-						selectedOptionId: 'none_of_the_above',
+						selectedOptionId: 'candidate-1',
 						confidence: 0.2,
 					},
 				],
 			}),
-			thresholds: new SeedThresholdPolicy(),
 			telemetry: 'off',
 		}).decide(requestContext, new AbortController().signal)
-		expect(low.status).toBe('none')
-		expect(
-			routeByConfidence(
-				0.8,
-				new SeedThresholdPolicy().resolve({ questionTemplate: 'candidate.select', risk: 'R1' })
-			)
-		).toBe('verify')
+		expect(low).toMatchObject({
+			status: 'selected',
+			selectedOptionId: 'candidate-1',
+			confidence: 0.2,
+		})
 	})
 
 	it('batches independent judgments into one System One request', async () => {
@@ -83,7 +78,6 @@ describe('@page-agent/decision-jev', () => {
 		const provider = new JevDecisionProvider({
 			model: 'jev-test',
 			transport,
-			thresholds: new SeedThresholdPolicy(),
 			telemetry: 'off',
 		})
 
